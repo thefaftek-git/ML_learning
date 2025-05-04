@@ -45,27 +45,27 @@ def parse_args():
                       help='Preserve the aspect ratio of the reference image')
     parser.add_argument('--latent-dim', type=int, default=100,
                       help='Dimension of the latent space')
-    parser.add_argument('--epochs', type=int, default=2000,
+    parser.add_argument('--epochs', type=int, default=500,
                       help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=1,
                       help='Batch size for training')
     parser.add_argument('--save-interval', type=int, default=100,
-                      help='Interval for saving model checkpoints and samples')
+                      help='DEPRECATED: Use visualization-interval instead (kept for backward compatibility)')
     parser.add_argument('--preview-dir', type=str, default='data/progress',
                       help='Directory to save progress preview images')
     # Performance optimization options
-    parser.add_argument('--visualization-interval', type=int, default=None,
-                      help='Interval for visualizations (separate from model saving, set higher to speed up training)')
-    parser.add_argument('--async-visualization', action='store_true',
-                      help='Generate visualizations in background threads to avoid pausing training')
+    parser.add_argument('--visualization-interval', type=int, default=100,
+                      help='Interval for visualizations and model saving')
+    parser.add_argument('--no-async-visualization', action='store_true',
+                      help='Disable asynchronous visualization generation (enabled by default)')
     parser.add_argument('--num-workers', type=int, default=None,
                       help='Number of worker threads for PyTorch (default: auto-detected based on CPU cores)')
     parser.add_argument('--use-gpu', action='store_true',
                       help='Use GPU acceleration if available')
     parser.add_argument('--mixed-precision', action='store_true',
                       help='Use mixed precision training (speeds up GPU training)')
-    parser.add_argument('--optimize-memory', action='store_true',
-                      help='Apply memory usage optimizations')
+    parser.add_argument('--no-optimize-memory', action='store_true',
+                      help='Disable memory usage optimizations (enabled by default)')
     
     return parser.parse_args()
 
@@ -286,7 +286,7 @@ def main():
     )
     
     # Apply memory optimizations if requested
-    if args.optimize_memory:
+    if not args.no_optimize_memory:
         print("Applying memory optimizations...")
         # Free unused memory cache for CUDA
         if device.type == "cuda":
@@ -300,8 +300,8 @@ def main():
     
     # Initial visualization
     print("Creating initial visualization...")
-    visualize_func = visualize_progress_async if args.async_visualization else visualize_progress
-    if not args.async_visualization:
+    visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
+    if args.no_async_visualization:
         initial_image = visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
     else:
         visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
@@ -356,12 +356,11 @@ def main():
             print(f"Epoch {epoch}/{args.epochs}, Loss: {loss:.6f}, " 
                   f"Time: {epoch_duration:.3f}s, Remaining: {remaining/60:.1f}m")
         
-        # Create visualization if needed
+        # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
+            # Create visualization
             visualize_func(generator, epoch, fixed_latent_vector, target_image, args.preview_dir)
-        
-        # Save model checkpoint and additional data
-        if epoch % args.save_interval == 0 or epoch == args.epochs:
+            
             # Save model checkpoint
             checkpoint_path = os.path.join(args.output_dir, f"generator_{epoch:04d}.pt")
             generator.save_model(checkpoint_path)
