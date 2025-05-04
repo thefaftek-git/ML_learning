@@ -1,0 +1,52 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Train Model (Default)",
+            "type": "shell",
+            "command": "python src/train.py",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Train Model (Rectangular 512x256)",
+            "type": "shell",
+            "command": "python src/train.py --epochs 10 --width 512 --height 256",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Train Model (Full Run)",
+            "type": "shell",
+            "command": "python src/train.py --visualization-interval 500 --epochs 2000 --width 512 --height 256",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Generate Image",
+            "type": "shell",
+            "command": "python src/generate.py",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

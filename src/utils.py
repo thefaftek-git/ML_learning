@@ -368,7 +368,8 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
     Args:
         reference_path: Path to the reference image
         output_dir: Directory to save processed outputs
-        size: Desired size for the processed image, if None uses original dimensions
+        size: Desired size for the processed image as (width, height) tuple or single int for square.
+             If None, uses original dimensions.
         show_preview: Whether to save a preview visualization
         preserve_dimensions: Whether to preserve the original aspect ratio
         
@@ -388,6 +389,19 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
     if size is None:
         size = original_dimensions
         print(f"Using original dimensions for training: {size[0]}x{size[1]}")
+    elif isinstance(size, int):
+        # Single integer means a square image
+        size = (size, size)
+    elif isinstance(size, tuple) and len(size) == 2:
+        # If either dimension is None, use original dimension
+        width, height = size
+        if width is None:
+            width = original_dimensions[1]
+        if height is None:
+            height = original_dimensions[0]
+        size = (height, width)  # Note: size is (height, width) for consistency with numpy arrays
+        
+    print(f"Processing reference image to dimensions: {size[0]}x{size[1]}")
     
     # Check if it's an SVG file
     file_ext = os.path.splitext(reference_path)[1].lower()

@@ -43,7 +43,11 @@ def parse_args():
     parser.add_argument('--output-dir', type=str, default='models',
                       help='Directory to save model checkpoints')
     parser.add_argument('--image-size', type=int, default=None,
-                      help='Base size for the output image (defaults to reference image size)')
+                      help='Base size for the output image (defaults to reference image size). This is a shorthand for setting both width and height to the same value.')
+    parser.add_argument('--width', type=int, default=None,
+                      help='Width for the output image (defaults to reference image width)')
+    parser.add_argument('--height', type=int, default=None,
+                      help='Height for the output image (defaults to reference image height)')
     parser.add_argument('--preserve-aspect', action='store_true',
                       help='Preserve the aspect ratio of the reference image')
     parser.add_argument('--latent-dim', type=int, default=100,
@@ -340,7 +344,7 @@ def main():
     reference_path = os.path.join(os.getcwd(), args.reference)
     
     # Get the processed image and original dimensions
-    if args.image_size is None:
+    if args.image_size is None and args.width is None and args.height is None:
         # Use original dimensions from the reference image
         target_image, original_dimensions = preprocess_reference_image(
             reference_path, args.preview_dir, size=None
@@ -349,12 +353,25 @@ def main():
         print(f"Using reference image's original dimensions: {image_size[0]}x{image_size[1]}")
     else:
         # Use the user-specified size
-        size = (args.image_size, args.image_size)
+        width = args.width if args.width is not None else args.image_size
+        height = args.height if args.height is not None else args.image_size
+        
+        # Important: preprocess_reference_image expects size=(height, width) but we want to be
+        # consistent with the model which expects image_size=(height, width)
         target_image, _ = preprocess_reference_image(
-            reference_path, args.preview_dir, size=size
+            reference_path, args.preview_dir, size=(height, width)
         )
-        image_size = size
-        print(f"Using user-specified dimensions: {image_size[0]}x{image_size[1]}")
+        
+        # The image_size tuple is (height, width) to be consistent with target_image.shape
+        image_size = (height, width)
+        print(f"Using user-specified dimensions: {height}x{width} (height x width)")
+        print(f"Target image shape: {target_image.shape}")
+        
+    # Convert image_size from (width, height) to (height, width) if needed
+    # Make sure image_size is in (height, width) format to match target_image.shape
+    if image_size[0] != target_image.shape[0] or image_size[1] != target_image.shape[1]:
+        print(f"Correcting dimension order: was {image_size}, now {target_image.shape[:2]}")
+        image_size = target_image.shape[:2]
     
     # Set up for parallel training if enabled
     if args.parallel:

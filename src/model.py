@@ -130,10 +130,8 @@ class ImageGenerator:
             
         print(f"Using device: {self.device}")
         
-        # Use the maximum dimension for square output size to ensure we can fit the entire image
-        output_size = max(image_size[0], image_size[1])
-        
-        # Initialize generator model
+        # Initialize generator model directly with the target dimensions
+        # (removed the maximum dimension calculation that was causing rectangular dimension issues)
         self.generator = Generator(latent_dim=latent_dim, output_size=image_size).to(self.device)
         
         # Initialize optimizer
