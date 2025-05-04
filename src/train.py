@@ -38,8 +38,21 @@ PROTECTED_MODELS = ["generator_best.pt", "generator_final.pt"]
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Train the image generator model')
-    parser.add_argument('--reference', type=str, default='reference.png',
-                      help='Path to the target reference image (JPG, PNG, or SVG)')
+    
+    # Input options
+    input_group = parser.add_argument_group('Input Options')
+    input_source = input_group.add_mutually_exclusive_group()
+    input_source.add_argument('--reference', type=str, default=None,
+                      help='Path to a single target reference image (JPG, PNG, or SVG)')
+    input_source.add_argument('--reference-dir', type=str, default=None,
+                      help='Path to a directory containing multiple reference images for training')
+    
+    # Set a default if neither option is provided
+    parser.set_defaults(reference='reference.png')
+    
+    parser.add_argument('--image-selection', type=str, choices=['sequential', 'random'], default='random',
+                      help='How to select images when training with multiple references: "sequential" cycles through them in order, "random" picks randomly each epoch')
+    
     parser.add_argument('--output-dir', type=str, default='models',
                       help='Directory to save model checkpoints')
     parser.add_argument('--image-size', type=int, default=None,
@@ -82,6 +95,316 @@ def parse_args():
                       help='Number of iterations per parallel training batch')
     
     return parser.parse_args()
+
+def load_reference_images(args, preview_dir):
+    """
+    Load reference images based on command-line arguments.
+    
+    This function handles both single image and directory-based image loading.
+    
+    Args:
+        args: Command-line arguments
+        preview_dir: Directory to save preview images
+        
+    Returns:
+        A tuple containing:
+        - List of preprocessed images
+        - List of image info dictionaries (each containing filename, dimensions, condition_id, etc.)
+        - Common image dimensions to use (height, width)
+        - Number of conditions (number of unique images)
+    """
+    images = []
+    image_info = []
+    
+    # Determine if we're loading from a directory or a single file
+    if args.reference_dir:
+        print(f"Loading images from directory: {args.reference_dir}")
+        reference_dir = os.path.join(os.getcwd(), args.reference_dir)
+        
+        # Check if directory exists
+        if not os.path.isdir(reference_dir):
+            raise ValueError(f"Reference directory '{reference_dir}' does not exist")
+        
+        # Get list of supported image files in the directory
+        supported_extensions = ['.png', '.jpg', '.jpeg', '.svg', '.bmp', '.gif']
+        image_files = []
+        
+        for filename in os.listdir(reference_dir):
+            if any(filename.lower().endswith(ext) for ext in supported_extensions):
+                image_files.append(os.path.join(reference_dir, filename))
+        
+        if not image_files:
+            raise ValueError(f"No supported image files found in '{reference_dir}'")
+            
+        print(f"Found {len(image_files)} images")
+        
+        # Get dimensions from the first image to use as reference
+        first_image_path = image_files[0]
+        _, original_dimensions = preprocess_reference_image(
+            first_image_path, preview_dir, size=None, show_preview=False
+        )
+        original_height, original_width = original_dimensions
+        
+        # Calculate target dimensions
+        target_dimensions = calculate_target_dimensions(
+            args, original_height, original_width, preview_dir
+        )
+        height, width = target_dimensions
+        print(f"Using common dimensions for all images: {height}x{width} (height x width)")
+        
+        # Create filename-to-condition_id mapping
+        # Sort filenames for consistent condition IDs across runs
+        sorted_filenames = sorted([os.path.basename(f) for f in image_files])
+        filename_to_condition = {name: i for i, name in enumerate(sorted_filenames)}
+        
+        print("Condition ID mapping:")
+        for filename, condition_id in filename_to_condition.items():
+            print(f"  {condition_id}: {filename}")
+        
+        # Process all images
+        for img_path in image_files:
+            filename = os.path.basename(img_path)
+            condition_id = filename_to_condition[filename]
+            print(f"Processing: {filename} (Condition ID: {condition_id})")
+            
+            # Process the image using the target dimensions
+            processed_img, _ = preprocess_reference_image(
+                img_path, preview_dir, size=target_dimensions, show_preview=False
+            )
+            
+            # Ensure all images have the same dimensions
+            if processed_img.shape[0] != height or processed_img.shape[1] != width:
+                print(f"Warning: Image {filename} has different dimensions. Resizing to match others.")
+                processed_img = resize_image(processed_img, (height, width))
+            
+            images.append(processed_img)
+            image_info.append({
+                'filename': filename,
+                'path': img_path,
+                'original_dimensions': original_dimensions,
+                'condition_id': condition_id  # Store condition ID with image info
+            })
+            
+        # Use a special preview image that includes all reference images
+        if len(images) > 1:
+            create_reference_grid(images, image_info, preview_dir)
+            
+        # Number of conditions is equal to number of unique images
+        num_conditions = len(images)
+            
+    else:
+        # Single image mode
+        reference_path = os.path.join(os.getcwd(), args.reference)
+        print(f"Processing single reference image: {args.reference}")
+        
+        # Get target dimensions
+        if args.image_size is None and args.width is None and args.height is None:
+            # Use original dimensions from the reference image
+            processed_img, original_dimensions = preprocess_reference_image(
+                reference_path, preview_dir, size=None
+            )
+            height, width = original_dimensions
+            print(f"Using reference image's original dimensions: {height}x{width}")
+        else:
+            # Calculate target dimensions based on arguments
+            _, original_dimensions = preprocess_reference_image(
+                reference_path, preview_dir, size=None, show_preview=False
+            )
+            original_height, original_width = original_dimensions
+            
+            # Calculate target dimensions
+            target_dimensions = calculate_target_dimensions(
+                args, original_height, original_width, preview_dir
+            )
+            height, width = target_dimensions
+            
+            # Process the image using the target dimensions
+            processed_img, _ = preprocess_reference_image(
+                reference_path, preview_dir, size=target_dimensions
+            )
+        
+        # Add the single image to our lists with condition_id = 0
+        images.append(processed_img)
+        image_info.append({
+            'filename': os.path.basename(reference_path),
+            'path': reference_path,
+            'original_dimensions': original_dimensions,
+            'condition_id': 0  # Single image always uses condition ID 0
+        })
+        
+        # Only one condition for a single image
+        num_conditions = 1
+    
+    return images, image_info, (height, width), num_conditions
+
+def calculate_target_dimensions(args, original_height, original_width, preview_dir):
+    """
+    Calculate the target dimensions based on command-line arguments and original image dimensions.
+    
+    Args:
+        args: Command-line arguments
+        original_height: Original image height
+        original_width: Original image width
+        preview_dir: Directory where previews are saved
+        
+    Returns:
+        Tuple of (height, width) dimensions to use
+    """
+    original_aspect_ratio = original_width / original_height
+    
+    # Use the user-specified size while maintaining aspect ratio
+    if args.image_size is not None:
+        # If image_size is provided, use square dimensions or maintain aspect ratio
+        if args.preserve_aspect:
+            # Maintain aspect ratio based on the reference image
+            if original_width >= original_height:
+                # Width-dominant image
+                width = args.image_size
+                height = int(width / original_aspect_ratio)
+            else:
+                # Height-dominant image
+                height = args.image_size
+                width = int(height * original_aspect_ratio)
+        else:
+            # Square dimensions
+            width = height = args.image_size
+    else:
+        # Handle separate width and height parameters
+        if args.width is not None and args.height is not None:
+            # Both width and height specified
+            width = args.width
+            height = args.height
+            
+            # Check if the aspect ratio matches
+            specified_aspect_ratio = width / height
+            aspect_ratio_difference = abs(specified_aspect_ratio - original_aspect_ratio) / original_aspect_ratio
+            
+            if aspect_ratio_difference > 0.01 and not args.preserve_aspect:  # 1% tolerance
+                print("\nWARNING: The specified dimensions do not match the aspect ratio of the reference image.")
+                print(f"Original aspect ratio: {original_aspect_ratio:.3f}, Specified: {specified_aspect_ratio:.3f}")
+                print("This may cause distortion in the generated images.")
+                print("Use --preserve-aspect to automatically maintain the original aspect ratio.")
+                print("Continuing with the specified dimensions...\n")
+            elif args.preserve_aspect:
+                # Adjust to preserve aspect ratio based on the larger dimension
+                if width >= height:
+                    # Width is the primary dimension
+                    height = int(width / original_aspect_ratio)
+                    print(f"Adjusting height to {height} to maintain aspect ratio")
+                else:
+                    # Height is the primary dimension
+                    width = int(height * original_aspect_ratio)
+                    print(f"Adjusting width to {width} to maintain aspect ratio")
+        elif args.width is not None:
+            # Only width specified, calculate height to maintain aspect ratio
+            width = args.width
+            height = int(width / original_aspect_ratio)
+            print(f"Using calculated height of {height} to maintain aspect ratio")
+        elif args.height is not None:
+            # Only height specified, calculate width to maintain aspect ratio
+            height = args.height
+            width = int(height * original_aspect_ratio)
+            print(f"Using calculated width of {width} to maintain aspect ratio")
+        else:
+            # No dimensions specified, use original dimensions
+            height, width = original_height, original_width
+    
+    print(f"Using dimensions: {height}x{width} (height x width)")
+    return height, width
+
+def resize_image(image, target_size):
+    """
+    Resize an image to target dimensions.
+    
+    Args:
+        image: Numpy array representing the image
+        target_size: Tuple of (height, width)
+        
+    Returns:
+        Resized image as numpy array
+    """
+    from skimage.transform import resize
+    
+    height, width = target_size
+    # If image already has the target size, return it unchanged
+    if image.shape[0] == height and image.shape[1] == width:
+        return image
+        
+    # Resize the image, preserving the number of channels
+    if len(image.shape) == 3:
+        # Multichannel image
+        resized = resize(image, (height, width, image.shape[2]), 
+                         anti_aliasing=True, preserve_range=True)
+    else:
+        # Grayscale image
+        resized = resize(image, (height, width), 
+                         anti_aliasing=True, preserve_range=True)
+        # Add channel dimension if it was present in the original
+        if len(image.shape) == 3:
+            resized = resized[..., np.newaxis]
+            
+    return resized.astype(image.dtype)
+
+def create_reference_grid(images, image_info, output_dir):
+    """
+    Create a grid visualization of all reference images.
+    
+    Args:
+        images: List of processed images
+        image_info: List of image info dictionaries
+        output_dir: Directory to save the visualization
+    """
+    import math
+    from matplotlib.gridspec import GridSpec
+    
+    # Determine grid size
+    n_images = len(images)
+    grid_size = math.ceil(math.sqrt(n_images))
+    rows = grid_size
+    cols = grid_size
+    
+    # Create a figure to show all reference images
+    plt.figure(figsize=(cols * 3, rows * 3))
+    gs = GridSpec(rows, cols)
+    
+    for i, (img, info) in enumerate(zip(images, image_info)):
+        ax = plt.subplot(gs[i // cols, i % cols])
+        ax.imshow(img[:, :, 0], cmap='gray')
+        ax.set_title(f"{info['filename']}")
+        ax.axis('off')
+    
+    plt.tight_layout()
+    grid_path = os.path.join(output_dir, 'reference_grid.png')
+    plt.savefig(grid_path)
+    plt.close()
+    
+    print(f"Created reference grid visualization: {grid_path}")
+
+def select_target_image(images, image_info, epoch, selection_method='random'):
+    """
+    Select a target image for the current training epoch.
+    
+    Args:
+        images: List of processed images
+        image_info: List of image info dictionaries
+        epoch: Current training epoch
+        selection_method: How to select the image ('random' or 'sequential')
+        
+    Returns:
+        Tuple of (selected image, image information)
+    """
+    if len(images) == 1:
+        # If only one image, always return it
+        return images[0], image_info[0]
+    
+    if selection_method == 'random':
+        # Randomly select an image
+        idx = np.random.randint(0, len(images))
+        return images[idx], image_info[idx]
+    else:
+        # Sequential selection - cycle through images based on epoch
+        idx = epoch % len(images)
+        return images[idx], image_info[idx]
 
 def visualize_progress(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False):
     """Save a visualization of training progress."""
@@ -225,13 +548,14 @@ def cleanup_models():
             # Small sleep to avoid overwhelming the file system
             time.sleep(0.01)
 
-def train_parallel_worker(worker_id, target_image, args, run_id, shared_results):
+def train_parallel_worker(worker_id, images, image_info, args, run_id, shared_results):
     """
     Worker function for parallel training.
     
     Args:
         worker_id: ID of this worker process
-        target_image: Target image to train on
+        images: List of target images to train on
+        image_info: List of image information dictionaries
         args: Command line arguments
         run_id: Unique ID for this run
         shared_results: Shared list to store results
@@ -247,9 +571,12 @@ def train_parallel_worker(worker_id, target_image, args, run_id, shared_results)
     worker_model_dir = os.path.join(args.output_dir, f"worker_{worker_id}_{run_id}")
     os.makedirs(worker_model_dir, exist_ok=True)
     
+    # Get image dimensions from the first image (all images should have the same dimensions)
+    image_size = (images[0].shape[0], images[0].shape[1])
+    
     # Initialize the generator model for this worker
     generator = ImageGenerator(
-        image_size=(target_image.shape[0], target_image.shape[1]),
+        image_size=image_size,
         latent_dim=args.latent_dim,
         device=device,
         mixed_precision=args.mixed_precision
@@ -264,6 +591,10 @@ def train_parallel_worker(worker_id, target_image, args, run_id, shared_results)
     best_model_path = None
     
     for i in range(args.parallel_iterations):
+        # Select a target image for this iteration
+        # For parallel workers, we use random selection to maximize exploration
+        target_image, _ = select_target_image(images, image_info, i, selection_method='random')
+        
         # Train for one step with a random latent vector for training
         training_latent = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
         loss = generator.train_step(target_image, training_latent)
@@ -294,6 +625,174 @@ def train_parallel_worker(worker_id, target_image, args, run_id, shared_results)
     })
     
     print(f"Worker {worker_id} completed training with best loss: {best_loss:.6f}")
+
+def create_final_comparison_grid(generator, latent_vector, images, image_info, output_dir):
+    """
+    Create comprehensive grid visualizations comparing generated images against all reference images.
+    
+    Args:
+        generator: The trained generator model
+        latent_vector: Fixed latent vector for generating the images
+        images: List of reference images
+        image_info: List of image info dictionaries
+        output_dir: Directory to save the visualization
+    """
+    import math
+    from matplotlib.gridspec import GridSpec
+    
+    n_images = len(images)
+    n_conditions = len(set(info['condition_id'] for info in image_info))
+    
+    # Generate images for each condition using the same latent vector
+    generated_images = []
+    for condition_id in range(n_conditions):
+        generated_image = generator.generate_image(latent_vector, condition_id)
+        generated_images.append(generated_image)
+    
+    # 1. Create comparison grid: generated images vs reference images
+    # One row per condition/reference pair
+    fig = plt.figure(figsize=(12, 4 * n_images))
+    gs = GridSpec(n_images, 2)
+    
+    for i, (ref_image, info) in enumerate(zip(images, image_info)):
+        condition_id = info['condition_id']
+        
+        # Plot the generated image for this condition
+        ax = plt.subplot(gs[i, 0])
+        ax.imshow(generated_images[condition_id][:, :, 0], cmap='gray')
+        ax.set_title(f"Generated (Condition {condition_id})")
+        ax.axis('off')
+        
+        # Plot the reference image
+        ax = plt.subplot(gs[i, 1])
+        ax.imshow(ref_image[:, :, 0], cmap='gray')
+        ax.set_title(f"Reference: {info['filename']}")
+        ax.axis('off')
+    
+    plt.tight_layout()
+    grid_path = os.path.join(output_dir, 'final_comparison_grid.png')
+    plt.savefig(grid_path)
+    plt.close()
+    
+    print(f"Created final comparison grid: {grid_path}")
+    
+    # 2. Create a row visualization with all images in a single row
+    # This view is better for directly comparing how the model performs across all references
+    fig = plt.figure(figsize=(3 * (n_images + 1), 4))
+    gs = GridSpec(1, n_images + 1)
+    
+    # Plot the first generated image
+    ax = plt.subplot(gs[0, 0])
+    ax.imshow(generated_images[0][:, :, 0], cmap='gray')
+    ax.set_title("Generated (Cond 0)")
+    ax.axis('off')
+    
+    # Plot all reference images
+    for i in range(n_images):
+        ax = plt.subplot(gs[0, i+1])
+        ax.imshow(images[i][:, :, 0], cmap='gray')
+        ax.set_title(f"{image_info[i]['filename']}")
+        ax.axis('off')
+    
+    plt.tight_layout()
+    row_path = os.path.join(output_dir, 'final_comparison_row.png')
+    plt.savefig(row_path)
+    plt.close()
+    
+    # 3. NEW: Create a comprehensive comparison showing all generations vs references
+    rows = 2  # Row 1: all generated images, Row 2: all reference images
+    cols = max(n_images, n_conditions)
+    
+    fig = plt.figure(figsize=(3 * cols, 3 * rows))
+    gs = GridSpec(rows, cols)
+    
+    # Row 1: All generated images
+    for i in range(n_conditions):
+        if i < cols:  # Only plot as many as we have columns
+            ax = plt.subplot(gs[0, i])
+            ax.imshow(generated_images[i][:, :, 0], cmap='gray')
+            ax.set_title(f"Generated (Cond {i})")
+            ax.axis('off')
+    
+    # Row 2: All reference images
+    for i in range(n_images):
+        if i < cols:  # Only plot as many as we have columns
+            ax = plt.subplot(gs[1, i])
+            ax.imshow(images[i][:, :, 0], cmap='gray')
+            ax.set_title(f"Reference {i}")
+            ax.axis('off')
+    
+    plt.tight_layout()
+    comprehensive_path = os.path.join(output_dir, 'all_conditions_comparison.png')
+    plt.savefig(comprehensive_path)
+    plt.close()
+    print(f"Created comprehensive condition comparison: {comprehensive_path}")
+    
+    # 4. NEW: Create condition-specific grid showing one condition across multiple latent vectors
+    # This helps visualize consistency within each condition
+    n_samples = 5  # Number of different latent vectors to try
+    
+    for condition_id in range(n_conditions):
+        # Get the reference image for this condition
+        ref_idx = next((i for i, info in enumerate(image_info) 
+                      if info['condition_id'] == condition_id), 0)
+        
+        fig = plt.figure(figsize=(3 * (n_samples + 1), 4))
+        
+        # Plot the reference image first
+        plt.subplot(1, n_samples + 1, 1)
+        plt.imshow(images[ref_idx][:, :, 0], cmap='gray')
+        plt.title(f"Reference\n{image_info[ref_idx]['filename']}")
+        plt.axis('off')
+        
+        # Generate n_samples images with different latent vectors
+        for i in range(n_samples):
+            # Generate a new random latent vector
+            rand_latent = np.random.normal(0, 1, latent_vector.shape)
+            
+            # Generate an image with this latent vector and the current condition
+            gen_img = generator.generate_image(rand_latent, condition_id)
+            
+            # Plot the generated image
+            plt.subplot(1, n_samples + 1, i + 2)
+            plt.imshow(gen_img[:, :, 0], cmap='gray')
+            plt.title(f"Sample {i+1}")
+            plt.axis('off')
+        
+        plt.tight_layout()
+        condition_path = os.path.join(output_dir, f'condition_{condition_id}_samples.png')
+        plt.savefig(condition_path)
+        plt.close()
+        print(f"Created samples for condition {condition_id}: {condition_path}")
+    
+    return generated_images
+
+def save_condition_mapping(image_info, output_path):
+    """
+    Save the mapping between condition IDs and image filenames to a JSON file.
+    This information will be used by the generation script.
+    
+    Args:
+        image_info: List of image info dictionaries
+        output_path: Path to save the JSON file
+    """
+    import json
+    
+    # Create a mapping dictionary
+    condition_mapping = {}
+    for info in image_info:
+        condition_id = info['condition_id']
+        filename = info['filename']
+        condition_mapping[condition_id] = {
+            'filename': filename,
+            'path': info['path']
+        }
+        
+    # Save to JSON file
+    with open(output_path, 'w') as f:
+        json.dump(condition_mapping, f, indent=2)
+        
+    print(f"Saved condition mapping to {output_path}")
 
 def main():
     """Main training function."""
@@ -339,39 +838,22 @@ def main():
     # Set visualization interval (if specified separately from save interval)
     vis_interval = args.visualization_interval or args.save_interval
     
-    # Preprocess the reference image
-    print(f"Processing reference image: {args.reference}")
-    reference_path = os.path.join(os.getcwd(), args.reference)
+    # Load reference images
+    images, image_info, image_size, num_conditions = load_reference_images(args, args.preview_dir)
+    num_images = len(images)
     
-    # Get the processed image and original dimensions
-    if args.image_size is None and args.width is None and args.height is None:
-        # Use original dimensions from the reference image
-        target_image, original_dimensions = preprocess_reference_image(
-            reference_path, args.preview_dir, size=None
-        )
-        image_size = original_dimensions
-        print(f"Using reference image's original dimensions: {image_size[0]}x{image_size[1]}")
+    if num_images > 1:
+        print(f"Training with {num_images} reference images using '{args.image_selection}' selection strategy")
     else:
-        # Use the user-specified size
-        width = args.width if args.width is not None else args.image_size
-        height = args.height if args.height is not None else args.image_size
-        
-        # Important: preprocess_reference_image expects size=(height, width) but we want to be
-        # consistent with the model which expects image_size=(height, width)
-        target_image, _ = preprocess_reference_image(
-            reference_path, args.preview_dir, size=(height, width)
-        )
-        
-        # The image_size tuple is (height, width) to be consistent with target_image.shape
-        image_size = (height, width)
-        print(f"Using user-specified dimensions: {height}x{width} (height x width)")
-        print(f"Target image shape: {target_image.shape}")
-        
-    # Convert image_size from (width, height) to (height, width) if needed
-    # Make sure image_size is in (height, width) format to match target_image.shape
-    if image_size[0] != target_image.shape[0] or image_size[1] != target_image.shape[1]:
-        print(f"Correcting dimension order: was {image_size}, now {target_image.shape[:2]}")
-        image_size = target_image.shape[:2]
+        print("Training with a single reference image")
+    
+    # Save condition mapping to a JSON file
+    condition_mapping_path = os.path.join(args.output_dir, "condition_mapping.json")
+    save_condition_mapping(image_info, condition_mapping_path)
+    
+    # Select a reference image for visualization
+    vis_target_image = images[0]  # Use the first image for visualization
+    height, width = image_size
     
     # Set up for parallel training if enabled
     if args.parallel:
@@ -427,9 +909,9 @@ def main():
         print("Creating initial visualization...")
         visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
         if args.no_async_visualization:
-            initial_image = visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
+            initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
         else:
-            visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
+            visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
         
         # Start timing
         start_time = time.time()
@@ -446,7 +928,7 @@ def main():
                 # Create and start worker processes
                 processes = []
                 for i in range(n_workers):
-                    p = Process(target=train_parallel_worker, args=(i, target_image, args, run_id, shared_results))
+                    p = Process(target=train_parallel_worker, args=(i, images, image_info, args, run_id, shared_results))
                     processes.append(p)
                     p.start()
                 
@@ -489,7 +971,7 @@ def main():
             
             # Visualize progress after each batch
             epoch_display = min(total_epochs, args.epochs)  # Cap at the requested number of epochs
-            visualize_func(generator, epoch_display, fixed_latent_vector, target_image, args.preview_dir)
+            visualize_func(generator, epoch_display, fixed_latent_vector, vis_target_image, args.preview_dir)
             
             # Save loss plot
             all_losses.extend([r['final_loss'] for r in results])
@@ -509,8 +991,14 @@ def main():
         print("Creating final visualization using best model...")
         if best_model_path:
             generator.load_model(best_model_path)
+            
+        # Create comprehensive comparisons with all reference images
+        if num_images > 1:
+            print("Creating final comparison visualizations for all conditions...")
+            create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, args.preview_dir)
+        
         final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
-                                       target_image, args.preview_dir, prefix="final", save_comparison=True)
+                                       vis_target_image, args.preview_dir, prefix="final", save_comparison=True)
         
         # Save the final best image as SVG
         final_svg_path = os.path.join(os.getcwd(), 'data', 'final_output.svg')
@@ -547,9 +1035,9 @@ def main():
     print("Creating initial visualization...")
     visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
     if args.no_async_visualization:
-        initial_image = visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
+        initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
     else:
-        visualize_func(generator, 0, fixed_latent_vector, target_image, args.preview_dir)
+        visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
     
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
@@ -582,11 +1070,17 @@ def main():
     for epoch in tqdm(range(1, args.epochs + 1)):
         epoch_start = time.time()
         
+        # Select target image for this epoch
+        target_image, target_info = select_target_image(images, image_info, epoch, args.image_selection)
+        if num_images > 1 and epoch % 10 == 0:
+            print(f"Epoch {epoch}: Training with image '{target_info['filename']}'")
+        
         # In each epoch we'll train with a random latent vector
         latent_vector = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
         
-        # Train for one step
-        loss = generator.train_step(target_image, latent_vector)
+        # Train for one step - pass the condition ID from the target info
+        condition_id = target_info['condition_id']
+        loss = generator.train_step(target_image, condition_id, latent_vector)
         losses.append(loss)
         
         # Calculate epoch timing
@@ -603,7 +1097,7 @@ def main():
         
         # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
-            # Create visualization
+            # Create visualization with the current target image
             visualize_func(generator, epoch, fixed_latent_vector, target_image, args.preview_dir)
             
             # Save model checkpoint
@@ -637,8 +1131,17 @@ def main():
     # Final visualization with the best model
     print("Loading best model for final visualization...")
     generator.load_model(best_model_path)
+    
+    # For the final visualization, create comparisons with each reference image
+    print("Creating final visualizations...")
+    
+    # Create a grid comparison of the model's output against all reference images
+    if num_images > 1:
+        create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, args.preview_dir)
+    
+    # Regular final visualization with the first image
     final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
-                                   target_image, args.preview_dir, prefix="final", save_comparison=True)
+                                   vis_target_image, args.preview_dir, prefix="final", save_comparison=True)
     
     print(f"Best loss achieved: {best_loss:.6f}")
     print(f"Progress visualizations saved to {args.preview_dir}")

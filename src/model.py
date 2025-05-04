@@ -17,10 +17,10 @@ class Generator(nn.Module):
     A PyTorch neural network model for generating 2D wireframe images.
     
     This implementation uses transposed convolutional layers to generate
-    images from a latent vector input.
+    images from a latent vector input and conditional embedding.
     """
     
-    def __init__(self, latent_dim=100, channels=1, output_size=256):
+    def __init__(self, latent_dim=100, channels=1, output_size=256, num_conditions=3):
         """
         Initialize the generator architecture.
         
@@ -28,12 +28,14 @@ class Generator(nn.Module):
             latent_dim: Dimension of the latent space input vector
             channels: Number of channels in the output image (1 for grayscale)
             output_size: Size of the output image (width/height)
+            num_conditions: Number of different conditional outputs the model can generate
         """
         super(Generator, self).__init__()
         
         # Store target output size
         self.target_height = output_size[0] if isinstance(output_size, tuple) else output_size
         self.target_width = output_size[1] if isinstance(output_size, tuple) else output_size
+        self.num_conditions = num_conditions
         
         # Determine the number of upsampling blocks needed
         self.base_size = 8  # Starting size for feature maps
@@ -53,8 +55,13 @@ class Generator(nn.Module):
         print(f"Creating generator with {self.num_upsample} upsampling blocks")
         print(f"Target size: {self.target_height}x{self.target_width}, Generated size before resizing: {self.generated_size}x{self.generated_size}")
         
-        # Initial dense layer to expand from latent space
-        self.fc = nn.Linear(latent_dim, self.base_size * self.base_size * 256)
+        # Embedding layer for condition input
+        # Creates a learnable embedding for each condition (image type)
+        self.condition_embedding = nn.Embedding(num_conditions, 32)
+        
+        # Initial dense layer to expand from latent space + condition
+        # Increased input dimension to accommodate condition embedding
+        self.fc = nn.Linear(latent_dim + 32, self.base_size * self.base_size * 256)
         
         # Create a sequence of upsampling blocks
         layers = []
@@ -72,18 +79,32 @@ class Generator(nn.Module):
         
         self.conv_layers = nn.Sequential(*layers)
     
-    def forward(self, z):
+    def forward(self, z, condition=None):
         """
         Forward pass through the generator.
         
         Args:
             z: Latent vector input of shape (batch_size, latent_dim)
+            condition: Integer tensor specifying which image type to generate
+                       (batch_size,), values from 0 to num_conditions-1
             
         Returns:
             Generated images of shape (batch_size, channels, height, width)
         """
-        # Project and reshape latent vector
-        x = self.fc(z)
+        batch_size = z.size(0)
+        
+        # If no condition provided, default to first condition (0)
+        if condition is None:
+            condition = torch.zeros(batch_size, dtype=torch.long, device=z.device)
+        
+        # Convert condition to embedding vector
+        condition_vector = self.condition_embedding(condition)
+        
+        # Concatenate latent vector with condition embedding
+        combined_input = torch.cat([z, condition_vector], dim=1)
+        
+        # Project and reshape combined input
+        x = self.fc(combined_input)
         x = x.view(x.shape[0], 256, self.base_size, self.base_size)
         
         # Apply transposed convolutions
@@ -104,22 +125,25 @@ class ImageGenerator:
     """
     A neural network model for generating 2D wireframe images.
     
-    This model uses a generative approach to create images that
-    progressively get closer to a target image through training.
+    This model uses a conditional generative approach to create images that
+    progressively get closer to multiple target images through training.
+    The model can be trained to generate different images based on a condition input.
     """
     
-    def __init__(self, image_size=(128, 128), latent_dim=100, device=None, mixed_precision=False):
+    def __init__(self, image_size=(128, 128), latent_dim=100, num_conditions=3, device=None, mixed_precision=False):
         """
         Initialize the image generator model.
         
         Args:
             image_size: Tuple of (height, width) for the output image size
             latent_dim: Dimension of the latent space for the generator
+            num_conditions: Number of different conditional outputs the model can generate
             device: PyTorch device to use (cuda or cpu)
             mixed_precision: Whether to use mixed precision training (FP16)
         """
         self.image_size = image_size
         self.latent_dim = latent_dim
+        self.num_conditions = num_conditions
         self.mixed_precision = mixed_precision
         
         # Initialize device (use provided or auto-detect GPU if available)
@@ -130,9 +154,12 @@ class ImageGenerator:
             
         print(f"Using device: {self.device}")
         
-        # Initialize generator model directly with the target dimensions
-        # (removed the maximum dimension calculation that was causing rectangular dimension issues)
-        self.generator = Generator(latent_dim=latent_dim, output_size=image_size).to(self.device)
+        # Initialize generator model directly with the target dimensions and condition support
+        self.generator = Generator(
+            latent_dim=latent_dim, 
+            output_size=image_size,
+            num_conditions=num_conditions
+        ).to(self.device)
         
         # Initialize optimizer
         self.optimizer = optim.Adam(
@@ -151,12 +178,13 @@ class ImageGenerator:
         else:
             self.mixed_precision = False
     
-    def generate_image(self, latent_vector=None):
+    def generate_image(self, latent_vector=None, condition_id=0):
         """
-        Generate an image using the generator model.
+        Generate an image using the generator model with a specific condition.
         
         Args:
             latent_vector: Input vector for the generator. If None, a random vector is used.
+            condition_id: Integer specifying which image type to generate (0 to num_conditions-1)
             
         Returns:
             Generated image as a numpy array
@@ -171,9 +199,12 @@ class ImageGenerator:
             # Convert to PyTorch tensor
             if isinstance(latent_vector, np.ndarray):
                 latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
+            
+            # Convert condition to tensor
+            condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
                 
-            # Generate the image
-            generated_image = self.generator(latent_vector)
+            # Generate the image with the condition
+            generated_image = self.generator(latent_vector, condition)
             
             # Move to CPU and convert to numpy array
             image_array = generated_image.cpu().numpy()
@@ -186,12 +217,13 @@ class ImageGenerator:
             
             return image_array
     
-    def train_step(self, target_image, latent_vector=None):
+    def train_step(self, target_image, condition_id, latent_vector=None):
         """
         Perform one training step to make the generated image closer to the target.
         
         Args:
             target_image: The target image to aim for
+            condition_id: Integer specifying which image type to generate (0 to num_conditions-1)
             latent_vector: Input vector for the generator. If None, a random vector is used.
             
         Returns:
@@ -206,6 +238,9 @@ class ImageGenerator:
         # Convert latent vector to tensor
         if isinstance(latent_vector, np.ndarray):
             latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
+        
+        # Convert condition to tensor
+        condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
         
         # Convert target image to tensor if it's a numpy array
         if isinstance(target_image, np.ndarray):
@@ -234,8 +269,8 @@ class ImageGenerator:
         # Use mixed precision if enabled
         if self.mixed_precision:
             with self.autocast():
-                # Generate image
-                generated_image = self.generator(latent_vector)
+                # Generate image with condition
+                generated_image = self.generator(latent_vector, condition)
                 
                 # Calculate loss (mean squared error)
                 loss = F.mse_loss(generated_image, target_tensor)
@@ -246,8 +281,8 @@ class ImageGenerator:
             self.scaler.update()
         else:
             # Standard precision training
-            # Generate image
-            generated_image = self.generator(latent_vector)
+            # Generate image with condition
+            generated_image = self.generator(latent_vector, condition)
             
             # Calculate loss (mean squared error)
             loss = F.mse_loss(generated_image, target_tensor)
@@ -265,7 +300,8 @@ class ImageGenerator:
             'generator_state_dict': self.generator.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'latent_dim': self.latent_dim,
-            'image_size': self.image_size
+            'image_size': self.image_size,
+            'num_conditions': self.num_conditions  # Save number of conditions
         }, filepath)
         print(f"Model saved to {filepath}")
     
@@ -277,9 +313,10 @@ class ImageGenerator:
         
         checkpoint = torch.load(filepath, map_location=self.device)
         
-        # Check for image size and latent dimension changes
+        # Check for architecture changes
         image_size_changed = False
         latent_dim_changed = False
+        num_conditions_changed = False
         
         if 'image_size' in checkpoint and checkpoint['image_size'] != self.image_size:
             print(f"Note: Saved model has different image size: {checkpoint['image_size']} vs current: {self.image_size}")
@@ -289,14 +326,23 @@ class ImageGenerator:
             print(f"Updating latent dimension from {self.latent_dim} to {checkpoint['latent_dim']}")
             self.latent_dim = checkpoint['latent_dim']
             latent_dim_changed = True
+            
+        if 'num_conditions' in checkpoint:
+            if checkpoint['num_conditions'] != self.num_conditions:
+                print(f"Updating number of conditions from {self.num_conditions} to {checkpoint['num_conditions']}")
+                self.num_conditions = checkpoint['num_conditions']
+                num_conditions_changed = True
         
         # Recreate the generator if needed due to architecture changes
-        if latent_dim_changed or image_size_changed:
-            # Use the saved image size if available, otherwise keep current
+        if latent_dim_changed or image_size_changed or num_conditions_changed:
+            # Use the saved parameters if available, otherwise keep current
             model_image_size = checkpoint.get('image_size', self.image_size)
+            model_num_conditions = checkpoint.get('num_conditions', self.num_conditions)
+            
             self.generator = Generator(
                 latent_dim=self.latent_dim,
-                output_size=model_image_size
+                output_size=model_image_size,
+                num_conditions=model_num_conditions
             ).to(self.device)
         
         # Load the state dictionaries
@@ -311,6 +357,7 @@ class ImageGenerator:
             # Create a new generator with the right dimensions but don't load weights
             self.generator = Generator(
                 latent_dim=self.latent_dim,
-                output_size=self.image_size
+                output_size=self.image_size,
+                num_conditions=self.num_conditions
             ).to(self.device)
             return False

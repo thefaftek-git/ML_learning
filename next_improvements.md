@@ -1,4 +1,3 @@
-allow for different width and height
 allow training based off of folder of files 
 GUID for each run
 save run stats for GUID in txt file
