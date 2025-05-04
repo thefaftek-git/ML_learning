@@ -1,0 +1,16 @@
+# Core dependencies
+numpy>=1.21.0
+matplotlib>=3.5.0
+pillow>=9.0.0
+scikit-learn>=1.0.0
+
+# Deep learning
+torch>=1.12.0
+torchvision>=0.13.0
+
+# SVG handling
+svgwrite>=1.4.0
+cairosvg>=2.5.0  # For SVG conversion
+
+# Utilities
+tqdm>=4.62.0     # Progress bars

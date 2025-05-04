@@ -1,0 +1,33 @@
+# 2D Image Generator ML Project
+
+This is a basic machine learning project that generates 2D wireframe images. The model starts from scratch without training data and learns to produce a specific SVG image.
+
+## Project Structure
+
+- `src/`: Source code for the image generation model
+- `models/`: Saved model checkpoints 
+- `data/`: Data including generated images and target SVG
+
+## Setup
+
+1. Install Python 3.8 or higher
+2. Install dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+## Usage
+
+1. Add your target SVG image to the `data/` directory
+2. Run the training script:
+   ```
+   python src/train.py
+   ```
+3. Generate new images:
+   ```
+   python src/generate.py
+   ```
+
+## Educational Purpose
+
+This project is designed for educational purposes to demonstrate how machine learning models can be trained to generate specific image output without pre-existing training data.
