@@ -356,7 +356,7 @@ def create_placeholder_svg(output_path, size=(128, 128), shape_type="circle"):
     dwg.save()
     print(f"Created placeholder SVG at {output_path}")
 
-def preprocess_reference_image(reference_path, output_dir, size=(128, 128), show_preview=True):
+def preprocess_reference_image(reference_path, output_dir, size=None, show_preview=True, preserve_dimensions=True):
     """
     Preprocess the reference image for training.
     
@@ -368,14 +368,26 @@ def preprocess_reference_image(reference_path, output_dir, size=(128, 128), show
     Args:
         reference_path: Path to the reference image
         output_dir: Directory to save processed outputs
-        size: Desired size for the processed image
+        size: Desired size for the processed image, if None uses original dimensions
         show_preview: Whether to save a preview visualization
-    
+        preserve_dimensions: Whether to preserve the original aspect ratio
+        
     Returns:
-        Processed image as a numpy array with shape (height, width, 1)
+        Tuple of (processed_image, original_dimensions) where:
+            - processed_image is a numpy array with shape (height, width, 1)
+            - original_dimensions is a tuple (height, width)
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Detect original image dimensions
+    original_dimensions = get_image_dimensions(reference_path)
+    print(f"Original reference image dimensions: {original_dimensions[0]}x{original_dimensions[1]}")
+    
+    # If size is not provided, use original dimensions
+    if size is None:
+        size = original_dimensions
+        print(f"Using original dimensions for training: {size[0]}x{size[1]}")
     
     # Check if it's an SVG file
     file_ext = os.path.splitext(reference_path)[1].lower()
@@ -388,19 +400,87 @@ def preprocess_reference_image(reference_path, output_dir, size=(128, 128), show
         processed_image = load_image(reference_path, size)
     
     if show_preview:
-        # Save the processed reference image for visualization
-        preview_path = os.path.join(output_dir, 'reference_processed.png')
-        plt.figure(figsize=(6, 6))
-        plt.imshow(processed_image[:, :, 0], cmap='gray')
-        plt.title("Processed Reference Image")
-        plt.axis('off')
-        plt.savefig(preview_path)
-        plt.close()
-        print(f"Saved processed reference preview to {preview_path}")
+        try:
+            # Save the processed reference image for visualization
+            preview_path = os.path.join(output_dir, 'reference_processed.png')
+            fig = plt.figure(figsize=(6, 6))
+            plt.imshow(processed_image[:, :, 0], cmap='gray')
+            plt.title("Processed Reference Image")
+            plt.axis('off')
+            plt.savefig(preview_path)
+            plt.close(fig)  # Explicitly close the figure to prevent memory leaks
+            print(f"Saved processed reference preview to {preview_path}")
+        except Exception as e:
+            print(f"Error saving preview: {e}")
+            plt.close('all')  # Ensure all figures are closed in case of error
     
     # Save as SVG for comparison with generated outputs
     svg_path = os.path.join(output_dir, 'reference_processed.svg')
     save_as_svg(processed_image, svg_path)
     print(f"Saved processed reference as SVG to {svg_path}")
     
-    return processed_image
+    return processed_image, original_dimensions
+
+def get_image_dimensions(image_path):
+    """
+    Get the original dimensions of an image file.
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Tuple (height, width) of the original image dimensions
+    """
+    # Check if the file exists
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found at {image_path}")
+    
+    # Handle based on file extension
+    file_ext = os.path.splitext(image_path)[1].lower()
+    
+    if file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+        # For raster image formats (JPG, PNG, etc.)
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+                return (height, width)
+        except Exception as e:
+            print(f"Error getting image dimensions: {e}")
+            return (256, 256)  # Default fallback size
+    elif file_ext == '.svg':
+        # For SVG images
+        try:
+            from xml.dom import minidom
+            doc = minidom.parse(image_path)
+            svg_elem = doc.getElementsByTagName('svg')[0]
+            
+            # Try to get width and height from SVG attributes
+            width = svg_elem.getAttribute('width')
+            height = svg_elem.getAttribute('height')
+            
+            # Parse dimensions, removing any units like 'px'
+            if width and height:
+                width = float(''.join(c for c in width if c.isdigit() or c == '.'))
+                height = float(''.join(c for c in height if c.isdigit() or c == '.'))
+                doc.unlink()
+                return (int(height), int(width))
+            
+            # If no explicit dimensions, try to find a viewBox
+            viewbox = svg_elem.getAttribute('viewBox')
+            if viewbox:
+                parts = viewbox.split()
+                if len(parts) == 4:
+                    width = float(parts[2])
+                    height = float(parts[3])
+                    doc.unlink()
+                    return (int(height), int(width))
+            
+            doc.unlink()
+            return (256, 256)  # Default size for SVGs without dimensions
+        except Exception as e:
+            print(f"Error getting SVG dimensions: {e}")
+            return (256, 256)  # Default fallback size
+    else:
+        # Unsupported format
+        print(f"Unsupported format for dimension detection: {file_ext}")
+        return (256, 256)  # Default fallback size

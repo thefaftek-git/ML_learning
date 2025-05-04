@@ -28,6 +28,40 @@ This is a basic machine learning project that generates 2D wireframe images. The
    python src/generate.py
    ```
 
+### Advanced Options
+
+The model now automatically detects and uses the resolution of your reference image:
+
+```
+# Use the reference image's native resolution (default behavior):
+python src/train.py
+
+# Use a custom resolution (if you prefer):
+python src/train.py --image-size 512
+```
+
+Other available options:
+
+```
+# Use GPU acceleration (if available):
+python src/train.py --use-gpu
+
+# Optimize memory usage:
+python src/train.py --optimize-memory
+
+# Run more training epochs:
+python src/train.py --epochs 5000
+```
+
+Run `python src/train.py --help` for the complete list of options.
+
+## Feature Highlights
+
+- **Automatic Resolution Detection**: Detects and uses the native resolution of your reference image by default
+- **Flexible Dimensions**: Handles arbitrary image dimensions and aspect ratios
+- **GPU Acceleration**: Supports hardware acceleration for faster training
+- **Progress Visualization**: Saves progress images during training to track improvement
+
 ## Educational Purpose
 
 This project is designed for educational purposes to demonstrate how machine learning models can be trained to generate specific image output without pre-existing training data.

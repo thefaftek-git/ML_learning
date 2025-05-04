@@ -31,17 +31,27 @@ class Generator(nn.Module):
         """
         super(Generator, self).__init__()
         
-        # Determine the number of upsampling blocks needed based on output size
+        # Store target output size
+        self.target_height = output_size[0] if isinstance(output_size, tuple) else output_size
+        self.target_width = output_size[1] if isinstance(output_size, tuple) else output_size
+        
+        # Determine the number of upsampling blocks needed
         self.base_size = 8  # Starting size for feature maps
         self.num_upsample = 0
         
-        # Calculate how many upsampling operations we need
+        # Calculate how many upsampling operations we need to get close to target size
+        # Each upsampling doubles the dimensions
+        max_dimension = max(self.target_height, self.target_width)
         temp_size = self.base_size
-        while temp_size < output_size:
+        while temp_size < max_dimension:
             temp_size *= 2
             self.num_upsample += 1
         
-        print(f"Creating generator with {self.num_upsample} upsampling blocks for output size {output_size}x{output_size}")
+        # The actual output size after upsampling will be base_size * 2^num_upsample
+        self.generated_size = self.base_size * (2 ** self.num_upsample)
+        
+        print(f"Creating generator with {self.num_upsample} upsampling blocks")
+        print(f"Target size: {self.target_height}x{self.target_width}, Generated size before resizing: {self.generated_size}x{self.generated_size}")
         
         # Initial dense layer to expand from latent space
         self.fc = nn.Linear(latent_dim, self.base_size * self.base_size * 256)
@@ -79,6 +89,15 @@ class Generator(nn.Module):
         # Apply transposed convolutions
         x = self.conv_layers(x)
         
+        # Resize to target dimensions if they don't match what's generated
+        if (x.shape[2] != self.target_height) or (x.shape[3] != self.target_width):
+            x = F.interpolate(
+                x, 
+                size=(self.target_height, self.target_width), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
         return x
 
 class ImageGenerator:
@@ -89,26 +108,33 @@ class ImageGenerator:
     progressively get closer to a target image through training.
     """
     
-    def __init__(self, image_size=(128, 128), latent_dim=100):
+    def __init__(self, image_size=(128, 128), latent_dim=100, device=None, mixed_precision=False):
         """
         Initialize the image generator model.
         
         Args:
             image_size: Tuple of (height, width) for the output image size
             latent_dim: Dimension of the latent space for the generator
+            device: PyTorch device to use (cuda or cpu)
+            mixed_precision: Whether to use mixed precision training (FP16)
         """
         self.image_size = image_size
         self.latent_dim = latent_dim
+        self.mixed_precision = mixed_precision
         
-        # Initialize device (use GPU if available)
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Initialize device (use provided or auto-detect GPU if available)
+        if device is None:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+            
         print(f"Using device: {self.device}")
         
         # Use the maximum dimension for square output size to ensure we can fit the entire image
         output_size = max(image_size[0], image_size[1])
         
         # Initialize generator model
-        self.generator = Generator(latent_dim=latent_dim, output_size=output_size).to(self.device)
+        self.generator = Generator(latent_dim=latent_dim, output_size=image_size).to(self.device)
         
         # Initialize optimizer
         self.optimizer = optim.Adam(
@@ -116,6 +142,16 @@ class ImageGenerator:
             lr=0.0002,
             betas=(0.5, 0.999)
         )
+        
+        # Set up mixed precision training if requested and using CUDA
+        if mixed_precision and self.device.type == 'cuda':
+            # Import autocast for mixed precision
+            from torch.cuda.amp import autocast, GradScaler
+            self.scaler = GradScaler()
+            self.autocast = autocast
+            print("Mixed precision training enabled")
+        else:
+            self.mixed_precision = False
     
     def generate_image(self, latent_vector=None):
         """
@@ -197,15 +233,30 @@ class ImageGenerator:
         # Reset gradients
         self.optimizer.zero_grad()
         
-        # Generate image
-        generated_image = self.generator(latent_vector)
-        
-        # Calculate loss (mean squared error)
-        loss = F.mse_loss(generated_image, target_tensor)
-        
-        # Backpropagate and update weights
-        loss.backward()
-        self.optimizer.step()
+        # Use mixed precision if enabled
+        if self.mixed_precision:
+            with self.autocast():
+                # Generate image
+                generated_image = self.generator(latent_vector)
+                
+                # Calculate loss (mean squared error)
+                loss = F.mse_loss(generated_image, target_tensor)
+                
+            # Backpropagate and update weights with gradient scaling
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Standard precision training
+            # Generate image
+            generated_image = self.generator(latent_vector)
+            
+            # Calculate loss (mean squared error)
+            loss = F.mse_loss(generated_image, target_tensor)
+            
+            # Backpropagate and update weights
+            loss.backward()
+            self.optimizer.step()
         
         return loss.item()
     
@@ -228,14 +279,40 @@ class ImageGenerator:
         
         checkpoint = torch.load(filepath, map_location=self.device)
         
-        # Recreate the generator if needed
-        if hasattr(checkpoint, 'latent_dim') and checkpoint['latent_dim'] != self.latent_dim:
+        # Check for image size and latent dimension changes
+        image_size_changed = False
+        latent_dim_changed = False
+        
+        if 'image_size' in checkpoint and checkpoint['image_size'] != self.image_size:
+            print(f"Note: Saved model has different image size: {checkpoint['image_size']} vs current: {self.image_size}")
+            image_size_changed = True
+        
+        if 'latent_dim' in checkpoint and checkpoint['latent_dim'] != self.latent_dim:
             print(f"Updating latent dimension from {self.latent_dim} to {checkpoint['latent_dim']}")
             self.latent_dim = checkpoint['latent_dim']
-            self.generator = Generator(latent_dim=self.latent_dim).to(self.device)
-            
+            latent_dim_changed = True
+        
+        # Recreate the generator if needed due to architecture changes
+        if latent_dim_changed or image_size_changed:
+            # Use the saved image size if available, otherwise keep current
+            model_image_size = checkpoint.get('image_size', self.image_size)
+            self.generator = Generator(
+                latent_dim=self.latent_dim,
+                output_size=model_image_size
+            ).to(self.device)
+        
         # Load the state dictionaries
-        self.generator.load_state_dict(checkpoint['generator_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f"Model loaded from {filepath}")
-        return True
+        try:
+            self.generator.load_state_dict(checkpoint['generator_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"Model loaded successfully from {filepath}")
+            return True
+        except Exception as e:
+            print(f"Error loading model state: {e}")
+            print("This might be due to architecture changes. Creating a new model with saved parameters.")
+            # Create a new generator with the right dimensions but don't load weights
+            self.generator = Generator(
+                latent_dim=self.latent_dim,
+                output_size=self.image_size
+            ).to(self.device)
+            return False
