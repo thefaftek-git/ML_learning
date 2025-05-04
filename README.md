@@ -51,6 +51,15 @@ python src/train.py --optimize-memory
 
 # Run more training epochs:
 python src/train.py --epochs 5000
+
+# Enable parallel training for speed improvements:
+python src/train.py --parallel
+
+# Specify number of parallel workers (default: auto-detect):
+python src/train.py --parallel --parallel-workers 4
+
+# Set iterations per parallel batch:
+python src/train.py --parallel --parallel-iterations 100
 ```
 
 Run `python src/train.py --help` for the complete list of options.
@@ -61,6 +70,18 @@ Run `python src/train.py --help` for the complete list of options.
 - **Flexible Dimensions**: Handles arbitrary image dimensions and aspect ratios
 - **GPU Acceleration**: Supports hardware acceleration for faster training
 - **Progress Visualization**: Saves progress images during training to track improvement
+- **Parallel Training**: Trains multiple models simultaneously and selects the best performers for continued training
+
+## Parallel Training
+
+The parallel training feature runs multiple model instances simultaneously and keeps only the best 10% (rounded down) of results from each parallel batch. This approach can significantly speed up training by exploring multiple solutions in parallel.
+
+**Note:** Parallel training may require more total iterations compared to sequential training to achieve equivalent results, as it explores different initialization paths. However, this is often outweighed by the speed improvements from parallelization.
+
+When using parallel training, consider:
+- Increasing the total number of epochs (`--epochs`) to ensure sufficient convergence
+- Adjusting the number of parallel workers based on your CPU capabilities
+- Setting a smaller `--visualization-interval` to track progress more frequently
 
 ## Educational Purpose
 
