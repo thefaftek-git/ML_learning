@@ -148,12 +148,21 @@ class ImageGenerator:
         
         # Initialize device (use provided or auto-detect GPU if available)
         if device is None:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
-            self.device = device
+            # If device is explicitly set to 'cuda', verify availability
+            if device == torch.device("cuda") and not torch.cuda.is_available():
+                print("WARNING: CUDA requested but not available. Falling back to CPU.")
+                self.device = torch.device("cpu")
+            else:
+                self.device = device
             
         print(f"Using device: {self.device}")
-        
+        if self.device.type == "cuda":
+            print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA device count: {torch.cuda.device_count()}")
+            print(f"CUDA current device: {torch.cuda.current_device()}")
+            
         # Initialize generator model directly with the target dimensions and condition support
         self.generator = Generator(
             latent_dim=latent_dim, 
@@ -233,14 +242,24 @@ class ImageGenerator:
         
         # Create latent vector if not provided
         if latent_vector is None:
-            latent_vector = np.random.normal(0, 1, (1, self.latent_dim))
+            batch_size = 1
+            latent_vector = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        elif isinstance(latent_vector, np.ndarray):
+            batch_size = latent_vector.shape[0]
+        else:
+            batch_size = latent_vector.size(0)
         
         # Convert latent vector to tensor
         if isinstance(latent_vector, np.ndarray):
             latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
         
-        # Convert condition to tensor
-        condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
+        # Convert condition to tensor and expand to match batch size
+        if isinstance(condition_id, int):
+            condition = torch.full((batch_size,), condition_id, dtype=torch.long, device=self.device)
+        else:
+            condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
+            if condition.size(0) != batch_size:
+                condition = condition.expand(batch_size)
         
         # Convert target image to tensor if it's a numpy array
         if isinstance(target_image, np.ndarray):
@@ -262,6 +281,11 @@ class ImageGenerator:
             
         # Rescale target to [-1, 1] to match generator output
         target_tensor = target_tensor * 2 - 1
+        
+        # If target is a single image but we have a batch,
+        # expand target to match batch size
+        if target_tensor.size(0) == 1 and batch_size > 1:
+            target_tensor = target_tensor.expand(batch_size, *target_tensor.shape[1:])
         
         # Reset gradients
         self.optimizer.zero_grad()

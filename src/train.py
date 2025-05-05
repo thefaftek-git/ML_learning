@@ -67,7 +67,7 @@ def parse_args():
                       help='Dimension of the latent space')
     parser.add_argument('--epochs', type=int, default=500,
                       help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=1,
+    parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for training')
     parser.add_argument('--save-interval', type=int, default=100,
                       help='DEPRECATED: Use visualization-interval instead (kept for backward compatibility)')
@@ -93,6 +93,9 @@ def parse_args():
                       help='Number of parallel training processes (default: auto-detect based on CPU cores)')
     parser.add_argument('--parallel-iterations', type=int, default=50,
                       help='Number of iterations per parallel training batch')
+    # New GPU optimization option
+    parser.add_argument('--steps-per-epoch', type=int, default=10,
+                      help='Number of training steps per epoch (default: 10, higher values increase GPU utilization)')
     
     return parser.parse_args()
 
@@ -548,225 +551,6 @@ def cleanup_models():
             # Small sleep to avoid overwhelming the file system
             time.sleep(0.01)
 
-def train_parallel_worker(worker_id, images, image_info, args, run_id, shared_results):
-    """
-    Worker function for parallel training.
-    
-    Args:
-        worker_id: ID of this worker process
-        images: List of target images to train on
-        image_info: List of image information dictionaries
-        args: Command line arguments
-        run_id: Unique ID for this run
-        shared_results: Shared list to store results
-        
-    Returns:
-        None (results are added to shared_results)
-    """
-    # Set device for this worker
-    # If using GPU, workers will use the same GPU but with different models
-    device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
-    
-    # Create a unique directory for this worker's outputs
-    worker_model_dir = os.path.join(args.output_dir, f"worker_{worker_id}_{run_id}")
-    os.makedirs(worker_model_dir, exist_ok=True)
-    
-    # Get image dimensions from the first image (all images should have the same dimensions)
-    image_size = (images[0].shape[0], images[0].shape[1])
-    
-    # Initialize the generator model for this worker
-    generator = ImageGenerator(
-        image_size=image_size,
-        latent_dim=args.latent_dim,
-        device=device,
-        mixed_precision=args.mixed_precision
-    )
-    
-    # Create a fixed latent vector for this worker
-    latent_vector = np.random.normal(0, 1, (1, args.latent_dim))
-    
-    # Train for the specified number of iterations
-    losses = []
-    best_loss = float('inf')
-    best_model_path = None
-    
-    for i in range(args.parallel_iterations):
-        # Select a target image for this iteration
-        # For parallel workers, we use random selection to maximize exploration
-        target_image, _ = select_target_image(images, image_info, i, selection_method='random')
-        
-        # Train for one step with a random latent vector for training
-        training_latent = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
-        loss = generator.train_step(target_image, training_latent)
-        losses.append(loss)
-        
-        # Update best loss if needed
-        if loss < best_loss:
-            best_loss = loss
-            # Save best model for this worker
-            best_model_path = os.path.join(worker_model_dir, f"generator_best_{worker_id}.pt")
-            generator.save_model(best_model_path)
-        
-        # Print progress occasionally
-        if (i + 1) % 10 == 0:
-            print(f"Worker {worker_id}: Iteration {i+1}/{args.parallel_iterations}, Loss: {loss:.6f}")
-    
-    # Save final model for this worker
-    final_model_path = os.path.join(worker_model_dir, f"generator_final_{worker_id}.pt")
-    generator.save_model(final_model_path)
-    
-    # Add result to shared list
-    shared_results.append({
-        'worker_id': worker_id,
-        'best_loss': best_loss,
-        'best_model_path': best_model_path,
-        'final_model_path': final_model_path,
-        'final_loss': losses[-1] if losses else float('inf')
-    })
-    
-    print(f"Worker {worker_id} completed training with best loss: {best_loss:.6f}")
-
-def create_final_comparison_grid(generator, latent_vector, images, image_info, output_dir):
-    """
-    Create comprehensive grid visualizations comparing generated images against all reference images.
-    
-    Args:
-        generator: The trained generator model
-        latent_vector: Fixed latent vector for generating the images
-        images: List of reference images
-        image_info: List of image info dictionaries
-        output_dir: Directory to save the visualization
-    """
-    import math
-    from matplotlib.gridspec import GridSpec
-    
-    n_images = len(images)
-    n_conditions = len(set(info['condition_id'] for info in image_info))
-    
-    # Generate images for each condition using the same latent vector
-    generated_images = []
-    for condition_id in range(n_conditions):
-        generated_image = generator.generate_image(latent_vector, condition_id)
-        generated_images.append(generated_image)
-    
-    # 1. Create comparison grid: generated images vs reference images
-    # One row per condition/reference pair
-    fig = plt.figure(figsize=(12, 4 * n_images))
-    gs = GridSpec(n_images, 2)
-    
-    for i, (ref_image, info) in enumerate(zip(images, image_info)):
-        condition_id = info['condition_id']
-        
-        # Plot the generated image for this condition
-        ax = plt.subplot(gs[i, 0])
-        ax.imshow(generated_images[condition_id][:, :, 0], cmap='gray')
-        ax.set_title(f"Generated (Condition {condition_id})")
-        ax.axis('off')
-        
-        # Plot the reference image
-        ax = plt.subplot(gs[i, 1])
-        ax.imshow(ref_image[:, :, 0], cmap='gray')
-        ax.set_title(f"Reference: {info['filename']}")
-        ax.axis('off')
-    
-    plt.tight_layout()
-    grid_path = os.path.join(output_dir, 'final_comparison_grid.png')
-    plt.savefig(grid_path)
-    plt.close()
-    
-    print(f"Created final comparison grid: {grid_path}")
-    
-    # 2. Create a row visualization with all images in a single row
-    # This view is better for directly comparing how the model performs across all references
-    fig = plt.figure(figsize=(3 * (n_images + 1), 4))
-    gs = GridSpec(1, n_images + 1)
-    
-    # Plot the first generated image
-    ax = plt.subplot(gs[0, 0])
-    ax.imshow(generated_images[0][:, :, 0], cmap='gray')
-    ax.set_title("Generated (Cond 0)")
-    ax.axis('off')
-    
-    # Plot all reference images
-    for i in range(n_images):
-        ax = plt.subplot(gs[0, i+1])
-        ax.imshow(images[i][:, :, 0], cmap='gray')
-        ax.set_title(f"{image_info[i]['filename']}")
-        ax.axis('off')
-    
-    plt.tight_layout()
-    row_path = os.path.join(output_dir, 'final_comparison_row.png')
-    plt.savefig(row_path)
-    plt.close()
-    
-    # 3. NEW: Create a comprehensive comparison showing all generations vs references
-    rows = 2  # Row 1: all generated images, Row 2: all reference images
-    cols = max(n_images, n_conditions)
-    
-    fig = plt.figure(figsize=(3 * cols, 3 * rows))
-    gs = GridSpec(rows, cols)
-    
-    # Row 1: All generated images
-    for i in range(n_conditions):
-        if i < cols:  # Only plot as many as we have columns
-            ax = plt.subplot(gs[0, i])
-            ax.imshow(generated_images[i][:, :, 0], cmap='gray')
-            ax.set_title(f"Generated (Cond {i})")
-            ax.axis('off')
-    
-    # Row 2: All reference images
-    for i in range(n_images):
-        if i < cols:  # Only plot as many as we have columns
-            ax = plt.subplot(gs[1, i])
-            ax.imshow(images[i][:, :, 0], cmap='gray')
-            ax.set_title(f"Reference {i}")
-            ax.axis('off')
-    
-    plt.tight_layout()
-    comprehensive_path = os.path.join(output_dir, 'all_conditions_comparison.png')
-    plt.savefig(comprehensive_path)
-    plt.close()
-    print(f"Created comprehensive condition comparison: {comprehensive_path}")
-    
-    # 4. NEW: Create condition-specific grid showing one condition across multiple latent vectors
-    # This helps visualize consistency within each condition
-    n_samples = 5  # Number of different latent vectors to try
-    
-    for condition_id in range(n_conditions):
-        # Get the reference image for this condition
-        ref_idx = next((i for i, info in enumerate(image_info) 
-                      if info['condition_id'] == condition_id), 0)
-        
-        fig = plt.figure(figsize=(3 * (n_samples + 1), 4))
-        
-        # Plot the reference image first
-        plt.subplot(1, n_samples + 1, 1)
-        plt.imshow(images[ref_idx][:, :, 0], cmap='gray')
-        plt.title(f"Reference\n{image_info[ref_idx]['filename']}")
-        plt.axis('off')
-        
-        # Generate n_samples images with different latent vectors
-        for i in range(n_samples):
-            # Generate a new random latent vector
-            rand_latent = np.random.normal(0, 1, latent_vector.shape)
-            
-            # Generate an image with this latent vector and the current condition
-            gen_img = generator.generate_image(rand_latent, condition_id)
-            
-            # Plot the generated image
-            plt.subplot(1, n_samples + 1, i + 2)
-            plt.imshow(gen_img[:, :, 0], cmap='gray')
-            plt.title(f"Sample {i+1}")
-            plt.axis('off')
-        
-        plt.tight_layout()
-        condition_path = os.path.join(output_dir, f'condition_{condition_id}_samples.png')
-        plt.savefig(condition_path)
-        plt.close()
-        print(f"Created samples for condition {condition_id}: {condition_path}")
-    
-    return generated_images
-
 def save_condition_mapping(image_info, output_path):
     """
     Save the mapping between condition IDs and image filenames to a JSON file.
@@ -820,6 +604,11 @@ def main():
     if device.type == "cuda":
         print(f"Using GPU acceleration: {torch.cuda.get_device_name(0)}")
         
+        # Set CUDA performance optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        print("CUDA optimizations enabled: cudnn.benchmark = True")
+        
         # Set up mixed precision training if requested
         if args.mixed_precision:
             print("Enabling mixed precision training")
@@ -855,160 +644,6 @@ def main():
     vis_target_image = images[0]  # Use the first image for visualization
     height, width = image_size
     
-    # Set up for parallel training if enabled
-    if args.parallel:
-        print("Parallel training mode enabled")
-        
-        # Warning about parallel training considerations
-        print("\nNOTE: Parallel training explores multiple random initialization paths simultaneously.")
-        print("While this can improve training speed, it may require more total iterations")
-        print("compared to sequential training to achieve equivalent results.")
-        print("Consider increasing the total number of epochs for more thorough convergence.\n")
-        
-        # Determine number of parallel workers
-        if args.parallel_workers is None:
-            # Auto-detect based on CPU cores, leave at least 1 core free
-            num_cores = os.cpu_count() or 4
-            n_workers = max(1, num_cores - 1)
-        else:
-            n_workers = args.parallel_workers
-        
-        print(f"Using {n_workers} parallel workers for training")
-        
-        # Create a unique run ID for this training session
-        run_id = str(uuid.uuid4())[:8]
-        print(f"Run ID: {run_id}")
-        
-        # Initialize list to track the total epochs processed
-        total_epochs = 0
-        
-        # Lists to track our losses and best models across all iterations
-        all_losses = []
-        best_loss = float('inf')
-        best_model_path = None
-        
-        # Calculate total number of epochs based on parallel iterations
-        total_target_epochs = args.epochs
-        epochs_per_batch = n_workers * args.parallel_iterations
-        num_batches = (total_target_epochs + epochs_per_batch - 1) // epochs_per_batch  # Ceiling division
-        
-        print(f"Training will run in {num_batches} parallel batches to reach {total_target_epochs} total epochs")
-        
-        # Initialize generator model for visualization and final training
-        generator = ImageGenerator(
-            image_size=image_size,
-            latent_dim=args.latent_dim,
-            device=device,
-            mixed_precision=args.mixed_precision
-        )
-        
-        # Create a fixed latent vector for progress visualization
-        fixed_latent_vector = np.random.normal(0, 1, (1, args.latent_dim))
-        
-        # Initial visualization
-        print("Creating initial visualization...")
-        visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
-        if args.no_async_visualization:
-            initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
-        else:
-            visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
-        
-        # Start timing
-        start_time = time.time()
-        
-        # Run multiple batches of parallel training
-        for batch in range(num_batches):
-            print(f"\nStarting parallel batch {batch+1}/{num_batches}")
-            
-            # Create a process pool for this batch
-            with Manager() as manager:
-                # Shared list to store results from all workers
-                shared_results = manager.list()
-                
-                # Create and start worker processes
-                processes = []
-                for i in range(n_workers):
-                    p = Process(target=train_parallel_worker, args=(i, images, image_info, args, run_id, shared_results))
-                    processes.append(p)
-                    p.start()
-                
-                # Wait for all processes to finish
-                for p in processes:
-                    p.join()
-                
-                # Convert shared list to regular list for processing
-                results = list(shared_results)
-                
-            # Sort results by loss (best first)
-            results.sort(key=lambda x: x['best_loss'])
-            
-            # Calculate how many models to keep (10% rounded down, minimum 1)
-            models_to_keep = max(1, int(len(results) * 0.1))
-            best_results = results[:models_to_keep]
-            
-            print(f"\nBatch {batch+1} complete. Keeping the best {models_to_keep} out of {len(results)} models.")
-            
-            # Print the best results
-            for i, result in enumerate(best_results):
-                print(f"  Rank {i+1}: Worker {result['worker_id']} - Loss: {result['best_loss']:.6f}")
-            
-            # Update the best overall model if needed
-            if best_results[0]['best_loss'] < best_loss:
-                best_loss = best_results[0]['best_loss']
-                best_model_path = best_results[0]['best_model_path']
-                print(f"New best model found with loss: {best_loss:.6f}")
-                
-                # Load the best model from this batch for continued training
-                generator.load_model(best_model_path)
-                
-                # Save it as the current best model
-                best_overall_path = os.path.join(args.output_dir, "generator_best.pt")
-                generator.save_model(best_overall_path)
-            
-            # Update total epochs processed
-            batch_epochs = n_workers * args.parallel_iterations
-            total_epochs += batch_epochs
-            
-            # Visualize progress after each batch
-            epoch_display = min(total_epochs, args.epochs)  # Cap at the requested number of epochs
-            visualize_func(generator, epoch_display, fixed_latent_vector, vis_target_image, args.preview_dir)
-            
-            # Save loss plot
-            all_losses.extend([r['final_loss'] for r in results])
-            save_loss_plot(all_losses, args.preview_dir)
-        
-        # Calculate total training time
-        total_time = time.time() - start_time
-        print(f"\nParallel training completed in {total_time/60:.2f} minutes")
-        print(f"Best loss achieved: {best_loss:.6f}")
-        
-        # Save final model
-        final_model_path = os.path.join(args.output_dir, "generator_final.pt")
-        generator.save_model(final_model_path)
-        print(f"Final model saved to {final_model_path}")
-        
-        # Final visualization with the best model
-        print("Creating final visualization using best model...")
-        if best_model_path:
-            generator.load_model(best_model_path)
-            
-        # Create comprehensive comparisons with all reference images
-        if num_images > 1:
-            print("Creating final comparison visualizations for all conditions...")
-            create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, args.preview_dir)
-        
-        final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
-                                       vis_target_image, args.preview_dir, prefix="final", save_comparison=True)
-        
-        # Save the final best image as SVG
-        final_svg_path = os.path.join(os.getcwd(), 'data', 'final_output.svg')
-        os.makedirs(os.path.dirname(final_svg_path), exist_ok=True)
-        save_as_svg(final_image, final_svg_path)
-        print(f"Final SVG output saved to {final_svg_path}")
-        
-        return  # End parallel training path
-    
-    # The rest of the function is the original sequential training path
     # Initialize the generator model
     print("Initializing generator model...")
     generator = ImageGenerator(
@@ -1070,18 +705,23 @@ def main():
     for epoch in tqdm(range(1, args.epochs + 1)):
         epoch_start = time.time()
         
-        # Select target image for this epoch
-        target_image, target_info = select_target_image(images, image_info, epoch, args.image_selection)
-        if num_images > 1 and epoch % 10 == 0:
-            print(f"Epoch {epoch}: Training with image '{target_info['filename']}'")
-        
-        # In each epoch we'll train with a random latent vector
-        latent_vector = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
-        
-        # Train for one step - pass the condition ID from the target info
-        condition_id = target_info['condition_id']
-        loss = generator.train_step(target_image, condition_id, latent_vector)
-        losses.append(loss)
+        epoch_loss = 0.0
+        # Run multiple training steps per epoch to improve GPU utilization
+        for step in range(args.steps_per_epoch):
+            # Select target image for this step
+            target_image, target_info = select_target_image(images, image_info, epoch * step, args.image_selection)
+            
+            # Create a batch of latent vectors for better GPU utilization
+            latent_vector = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
+            
+            # Train with the full batch - pass the condition ID from the target info
+            condition_id = target_info['condition_id']
+            step_loss = generator.train_step(target_image, condition_id, latent_vector)
+            epoch_loss += step_loss
+            
+        # Calculate average loss for this epoch
+        avg_epoch_loss = epoch_loss / args.steps_per_epoch
+        losses.append(avg_epoch_loss)
         
         # Calculate epoch timing
         epoch_end = time.time()
@@ -1092,13 +732,14 @@ def main():
         if epoch % 10 == 0:
             avg_time = sum(epoch_times[-10:]) / min(10, len(epoch_times[-10:]))
             remaining = (args.epochs - epoch) * avg_time
-            print(f"Epoch {epoch}/{args.epochs}, Loss: {loss:.6f}, " 
+            print(f"Epoch {epoch}/{args.epochs}, Loss: {avg_epoch_loss:.6f}, " 
+                  f"Steps: {args.steps_per_epoch}, Batch: {args.batch_size}, "
                   f"Time: {epoch_duration:.3f}s, Remaining: {remaining/60:.1f}m")
         
         # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
             # Create visualization with the current target image
-            visualize_func(generator, epoch, fixed_latent_vector, target_image, args.preview_dir)
+            visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, args.preview_dir)
             
             # Save model checkpoint
             checkpoint_path = os.path.join(args.output_dir, f"generator_{epoch:04d}.pt")
@@ -1106,14 +747,14 @@ def main():
             print(f"Saved model checkpoint to {checkpoint_path}")
             
             # Register this model for tracking and potential cleanup
-            register_model_checkpoint(checkpoint_path, epoch, loss)
+            register_model_checkpoint(checkpoint_path, epoch, avg_epoch_loss)
             
             # Save loss plot
             save_loss_plot(losses, args.preview_dir)
         
         # Save the best model based on loss
-        if loss < best_loss:
-            best_loss = loss
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
             best_model_path = os.path.join(args.output_dir, "generator_best.pt")
             generator.save_model(best_model_path)
     

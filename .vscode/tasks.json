@@ -38,6 +38,45 @@
             "problemMatcher": []
         },
         {
+            "label": "Train Model (GPU Optimized)",
+            "type": "shell",
+            "command": "python -v src/train.py --use-gpu --mixed-precision --batch-size 32 --steps-per-epoch 10 --epochs 20",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Train Model (GPU Debug)",
+            "type": "shell",
+            "command": "python src/train.py --use-gpu --mixed-precision --batch-size 32 --steps-per-epoch 10 --epochs 20 > training_log.txt 2>&1",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Train Model (Optimized 256x256)",
+            "type": "shell",
+            "command": "python src/train.py --use-gpu --mixed-precision --batch-size 64 --steps-per-epoch 20 --epochs 50 --image-size 256",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "Generate Image",
             "type": "shell",
             "command": "python src/generate.py",
