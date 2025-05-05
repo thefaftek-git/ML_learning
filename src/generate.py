@@ -11,14 +11,19 @@ import json
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 from model import ImageGenerator
 from utils import save_as_svg, create_placeholder_svg
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Generate images using the trained model')
-    parser.add_argument('--model', type=str, default='models/generator_final.pt',
-                        help='Path to the trained model file')
+    parser.add_argument('--model', type=str, default='latest',
+                        help='Path to the trained model file or "latest" to use the latest run')
+    parser.add_argument('--run-guid', type=str, default=None,
+                        help='Specific run GUID to use for generation')
+    parser.add_argument('--model-file', type=str, default='generator_final.pt',
+                        help='Model file to use within the run folder (default: generator_final.pt)')
     parser.add_argument('--count', type=int, default=5,
                         help='Number of images to generate')
     parser.add_argument('--output-dir', type=str, default='data/generated',
@@ -33,10 +38,12 @@ def parse_args():
                         help='Number of interpolation steps (only for interpolate mode)')
     parser.add_argument('--condition', type=str, default=None,
                         help='Specify which condition to use for generation (condition ID or filename)')
-    parser.add_argument('--mapping-file', type=str, default='models/condition_mapping.json',
-                        help='Path to the condition mapping file (JSON)')
+    parser.add_argument('--mapping-file', type=str, default=None,
+                        help='Path to the condition mapping file (JSON). If not provided, will look in the model directory.')
     parser.add_argument('--interactive', action='store_true',
                         help='Run in interactive mode to select conditions')
+    parser.add_argument('--models-dir', type=str, default='models',
+                        help='Base directory where model runs are stored')
     
     return parser.parse_args()
 
@@ -256,13 +263,75 @@ def generate_all_conditions(generator, output_dir, condition_mapping):
     plt.close()
     print(f"Comparison of all conditions saved to {grid_path}")
 
+def find_latest_run_guid(models_dir):
+    """Find the GUID of the latest training run.
+    
+    First checks for a "latest_run.txt" file, then tries to find the newest directory.
+    
+    Args:
+        models_dir: Base directory containing model run folders
+    
+    Returns:
+        GUID of latest run or None if not found
+    """
+    # Check for latest_run.txt file first
+    latest_run_file = os.path.join(models_dir, "latest_run.txt")
+    if os.path.exists(latest_run_file):
+        try:
+            with open(latest_run_file, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.startswith("Latest run GUID:"):
+                        guid = line.split(":", 1)[1].strip()
+                        if os.path.isdir(os.path.join(models_dir, guid)):
+                            print(f"Found latest run GUID from file: {guid}")
+                            return guid
+        except Exception as e:
+            print(f"Error reading latest run file: {e}")
+    
+    # If no valid GUID from file, find most recently modified directory
+    try:
+        subdirs = [d for d in os.listdir(models_dir) 
+                  if os.path.isdir(os.path.join(models_dir, d)) and len(d) > 8]  # Filter likely GUIDs
+        
+        if not subdirs:
+            return None
+            
+        # Sort by modification time (newest first)
+        subdirs.sort(key=lambda d: os.path.getmtime(os.path.join(models_dir, d)), reverse=True)
+        latest_guid = subdirs[0]
+        print(f"Found latest run GUID by timestamp: {latest_guid}")
+        return latest_guid
+    
+    except Exception as e:
+        print(f"Error finding latest run: {e}")
+        return None
+
 def main():
     """Main function for image generation."""
     args = parse_args()
     
-    # Check if the model exists, otherwise create a placeholder SVG
-    if not os.path.exists(args.model):
-        print(f"Model file not found at {args.model}")
+    # Resolve the model path from arguments
+    model_path = args.model
+    model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else args.models_dir
+    
+    # If model is 'latest' or a run GUID is specified, resolve the actual path
+    if args.model == 'latest' or args.run_guid:
+        guid = args.run_guid if args.run_guid else find_latest_run_guid(args.models_dir)
+        
+        if not guid:
+            print("No valid run GUID found. Please specify a model path or run GUID.")
+            return
+        
+        # Use the specified model file within the run folder
+        model_dir = os.path.join(args.models_dir, guid)
+        model_path = os.path.join(model_dir, args.model_file)
+        
+        print(f"Using model from run {guid}: {model_path}")
+    
+    # Check if the model exists, otherwise create placeholder SVGs
+    if not os.path.exists(model_path):
+        print(f"Model file not found at {model_path}")
         print("Creating placeholder SVG images instead...")
         
         os.makedirs(args.output_dir, exist_ok=True)
@@ -275,8 +344,15 @@ def main():
         
         return
     
+    # Determine the mapping file path if not provided
+    mapping_file = args.mapping_file
+    if not mapping_file:
+        # Look for mapping file in the same directory as the model
+        mapping_file = os.path.join(model_dir, "condition_mapping.json")
+        print(f"Looking for condition mapping at: {mapping_file}")
+    
     # Load the condition mapping
-    condition_mapping = load_condition_mapping(args.mapping_file)
+    condition_mapping = load_condition_mapping(mapping_file)
     
     # Initialize the model
     generator = ImageGenerator(
@@ -286,8 +362,14 @@ def main():
     )
     
     # Load the trained model
-    print(f"Loading model from {args.model}")
-    generator.load_model(args.model)
+    print(f"Loading model from {model_path}")
+    generator.load_model(model_path)
+    
+    # Make a subfolder for this run in the output directory
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    model_name = os.path.basename(model_path).replace(".pt", "")
+    output_subdir = os.path.join(args.output_dir, f"{timestamp}_{model_name}")
+    os.makedirs(output_subdir, exist_ok=True)
     
     # Determine which condition to use
     condition_id = 0  # Default condition
@@ -302,15 +384,15 @@ def main():
     # Generate images based on the selected mode
     if args.mode == 'random':
         print(f"Generating {args.count} random images with condition ID {condition_id}...")
-        generate_random_images(generator, args.count, args.output_dir, condition_id, condition_mapping)
+        generate_random_images(generator, args.count, output_subdir, condition_id, condition_mapping)
     elif args.mode == 'interpolate':
         print(f"Generating {args.steps} interpolated images with condition ID {condition_id}...")
-        generate_interpolated_images(generator, args.steps, args.output_dir, condition_id, condition_mapping)
+        generate_interpolated_images(generator, args.steps, output_subdir, condition_id, condition_mapping)
     elif args.mode == 'all-conditions':
         print(f"Generating images for all available conditions...")
-        generate_all_conditions(generator, args.output_dir, condition_mapping)
+        generate_all_conditions(generator, output_subdir, condition_mapping)
     
-    print("Image generation completed successfully.")
+    print(f"Image generation completed successfully. Results saved to {output_subdir}")
 
 if __name__ == "__main__":
     main()

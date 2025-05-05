@@ -99,6 +99,244 @@ def parse_args():
     
     return parser.parse_args()
 
+def collect_system_info():
+    """
+    Collect system information for run metadata.
+    
+    Returns:
+        Dictionary containing system information
+    """
+    import platform
+    import sys
+    
+    system_info = {
+        "os": platform.platform(),
+        "python_version": sys.version,
+        "cpu_info": platform.processor(),
+        "cpu_count": os.cpu_count(),
+    }
+    
+    # Add GPU information if available
+    if torch.cuda.is_available():
+        system_info["gpu_available"] = True
+        system_info["gpu_name"] = torch.cuda.get_device_name(0)
+        system_info["gpu_count"] = torch.cuda.device_count()
+        system_info["cuda_version"] = torch.version.cuda
+    else:
+        system_info["gpu_available"] = False
+    
+    # Get memory information if psutil is available
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        system_info["total_memory_gb"] = round(memory.total / (1024**3), 2)
+        system_info["available_memory_gb"] = round(memory.available / (1024**3), 2)
+    except ImportError:
+        pass
+    
+    return system_info
+
+def create_run_summary(run_guid, run_metadata, run_stats, image_info, system_info, output_path):
+    """
+    Create a comprehensive human-readable summary of the training run.
+    
+    Args:
+        run_guid: GUID of the training run
+        run_metadata: Dictionary containing run metadata
+        run_stats: Dictionary containing training statistics
+        image_info: List of image info dictionaries
+        system_info: Dictionary containing system information
+        output_path: Path to save the summary
+    """
+    with open(output_path, 'w') as f:
+        # Header
+        f.write("=" * 80 + "\n")
+        f.write(f"TRAINING RUN SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Run identification
+        f.write(f"Run GUID: {run_guid}\n")
+        f.write(f"Timestamp: {run_metadata['timestamp']}\n")
+        f.write("\n")
+        
+        # System information
+        f.write("-" * 80 + "\n")
+        f.write("SYSTEM INFORMATION\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"OS: {system_info.get('os', 'Unknown')}\n")
+        f.write(f"Python: {system_info.get('python_version', 'Unknown').split()[0]}\n")
+        f.write(f"CPU: {system_info.get('cpu_info', 'Unknown')}\n")
+        f.write(f"CPU Cores: {system_info.get('cpu_count', 'Unknown')}\n")
+        
+        if system_info.get('gpu_available', False):
+            f.write(f"GPU: {system_info.get('gpu_name', 'Unknown')}\n")
+            f.write(f"CUDA Version: {system_info.get('cuda_version', 'Unknown')}\n")
+        else:
+            f.write("GPU: Not used\n")
+            
+        if 'total_memory_gb' in system_info:
+            f.write(f"System Memory: {system_info['total_memory_gb']} GB total, "
+                    f"{system_info['available_memory_gb']} GB available at run start\n")
+        f.write("\n")
+        
+        # Command arguments
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING PARAMETERS\n")
+        f.write("-" * 80 + "\n")
+        for arg, value in run_metadata['arguments'].items():
+            if arg not in ['output_dir', 'preview_dir']:  # Skip less important params
+                f.write(f"{arg}: {value}\n")
+        f.write("\n")
+        
+        # Image dataset information
+        f.write("-" * 80 + "\n")
+        f.write("IMAGE DATASET\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Number of images: {len(image_info)}\n")
+        if len(image_info) > 0:
+            dims = image_info[0].get('original_dimensions', ('Unknown', 'Unknown'))
+            f.write(f"Original dimensions (first image): {dims[0]}x{dims[1]}\n")
+            
+            # Add resizing information if applicable
+            if 'image_size' in run_metadata['arguments'] and run_metadata['arguments']['image_size'] is not None:
+                f.write(f"Resized to: {run_metadata['arguments']['image_size']}x{run_metadata['arguments']['image_size']}\n")
+            elif 'width' in run_metadata['arguments'] and 'height' in run_metadata['arguments']:
+                if run_metadata['arguments']['width'] is not None and run_metadata['arguments']['height'] is not None:
+                    f.write(f"Resized to: {run_metadata['arguments']['width']}x{run_metadata['arguments']['height']}\n")
+            
+            f.write("\nImage mapping:\n")
+            for info in image_info:
+                f.write(f"  ID {info['condition_id']}: {info['filename']}\n")
+        f.write("\n")
+        
+        # Model information
+        f.write("-" * 80 + "\n")
+        f.write("MODEL INFORMATION\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Latent dimension: {run_metadata['arguments'].get('latent_dim', 'Unknown')}\n")
+        f.write(f"Batch size: {run_metadata['arguments'].get('batch_size', 'Unknown')}\n")
+        f.write(f"Steps per epoch: {run_metadata['arguments'].get('steps_per_epoch', 'Unknown')}\n")
+        f.write("\n")
+        
+        # Training statistics
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING STATISTICS\n")
+        f.write("-" * 80 + "\n")
+        
+        # Training time
+        total_time = run_stats.get('total_training_time', 0)
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = int(total_time % 60)
+        f.write(f"Total training time: {hours}h {minutes}m {seconds}s\n")
+        f.write(f"Average time per epoch: {run_stats.get('avg_epoch_time', 0):.3f} seconds\n")
+        
+        # Loss information
+        f.write(f"Final loss: {run_stats['epoch_losses'][-1] if run_stats['epoch_losses'] else 'Unknown'}\n")
+        if run_stats.get('best_loss') is not None:
+            f.write(f"Best loss: {run_stats['best_loss']} (epoch {run_stats['best_epoch']})\n")
+        
+        # Calculate loss change rates
+        if len(run_stats['epoch_losses']) > 5:
+            # Calculate early, mid, and late loss changes
+            early_change = run_stats['epoch_losses'][10] - run_stats['epoch_losses'][0] if len(run_stats['epoch_losses']) > 10 else None
+            mid_idx = len(run_stats['epoch_losses']) // 2
+            mid_change = run_stats['epoch_losses'][mid_idx] - run_stats['epoch_losses'][0] if mid_idx > 0 else None
+            late_change = run_stats['epoch_losses'][-1] - run_stats['epoch_losses'][-6] if len(run_stats['epoch_losses']) > 5 else None
+            
+            if early_change is not None:
+                f.write(f"Early loss change rate (first 10 epochs): {early_change/10:.6f} per epoch\n")
+            if mid_change is not None:
+                f.write(f"Mid-training loss change rate: {mid_change/mid_idx:.6f} per epoch\n")
+            if late_change is not None:
+                f.write(f"Late loss change rate (last 5 epochs): {late_change/5:.6f} per epoch\n")
+                
+            # Check for convergence
+            if abs(late_change/5) < 0.0001:
+                f.write("Status: Training appears to have converged (minimal loss change)\n")
+            else:
+                f.write("Status: Training was likely still improving when stopped\n")
+        f.write("\n")
+        
+        # Saved files
+        f.write("-" * 80 + "\n")
+        f.write("OUTPUT FILES\n")
+        f.write("-" * 80 + "\n")
+        run_dir = os.path.dirname(output_path)
+        f.write(f"Model checkpoints and visualizations saved in:\n")
+        f.write(f"- Models: {run_dir}\n")
+        preview_dir = os.path.join(run_metadata['arguments']['preview_dir'], run_guid)
+        f.write(f"- Visualizations: {preview_dir}\n")
+        f.write("\n")
+        
+        # Recommendations
+        f.write("-" * 80 + "\n")
+        f.write("RECOMMENDATIONS\n")
+        f.write("-" * 80 + "\n")
+        
+        # Provide recommendations based on training outcomes
+        if run_stats.get('best_epoch') is not None and run_stats['best_epoch'] < len(run_stats['epoch_losses']) * 0.8:
+            f.write("- Best model occurred early in training. Consider reducing learning rate or regularization.\n")
+        
+        if len(run_stats['epoch_losses']) > 5:
+            if run_stats['epoch_losses'][-1] > 0.1:
+                f.write("- Final loss still high. Consider training for more epochs.\n")
+            
+            if abs(late_change/5) > 0.001:
+                f.write("- Loss was still decreasing. Consider training for more epochs.\n")
+                
+        if len(image_info) == 1:
+            f.write("- Training with more reference images might improve versatility of the model.\n")
+            
+        f.write("\n")
+        
+        # Footer
+        f.write("=" * 80 + "\n")
+        f.write(f"End of summary for run {run_guid}\n")
+        f.write("=" * 80 + "\n")
+    
+    print(f"Comprehensive run summary saved to {output_path}")
+
+def save_model_architecture_info(generator, output_path):
+    """
+    Save model architecture information to a file.
+    
+    Args:
+        generator: The model instance
+        output_path: Path to save the architecture information
+    """
+    try:
+        with open(output_path, 'w') as f:
+            f.write(f"Model Architecture:\n")
+            f.write("=" * 80 + "\n")
+            
+            # Get generator architecture if available
+            if hasattr(generator, 'get_architecture_info'):
+                arch_info = generator.get_architecture_info()
+                for key, value in arch_info.items():
+                    f.write(f"{key}: {value}\n")
+            else:
+                # Model class doesn't have architecture info method
+                # Try to get basic model attributes
+                f.write(f"Input image size: {generator.image_size}\n")
+                f.write(f"Latent dimension: {generator.latent_dim}\n")
+                f.write(f"Device: {generator.device}\n")
+                if hasattr(generator, 'model') and hasattr(generator.model, '__str__'):
+                    f.write("\nModel structure:\n")
+                    f.write(str(generator.model))
+                    
+            f.write("\n")
+            
+            # Add parameter count
+            total_params = sum(p.numel() for p in generator.parameters())
+            trainable_params = sum(p.numel() for p in generator.parameters() if p.requires_grad)
+            f.write(f"Total parameters: {total_params:,}\n")
+            f.write(f"Trainable parameters: {trainable_params:,}\n")
+            
+        print(f"Model architecture information saved to {output_path}")
+    except Exception as e:
+        print(f"Error saving model architecture information: {e}")
+
 def load_reference_images(args, preview_dir):
     """
     Load reference images based on command-line arguments.
@@ -578,13 +816,161 @@ def save_condition_mapping(image_info, output_path):
         
     print(f"Saved condition mapping to {output_path}")
 
+def create_final_comparison_grid(generator, latent_vector, images, image_info, output_dir):
+    """
+    Create a grid visualization comparing the model's output against all reference images.
+    
+    Args:
+        generator: The trained generator model
+        latent_vector: Fixed latent vector for consistent generation
+        images: List of all reference images
+        image_info: List of image info dictionaries
+        output_dir: Directory to save the visualization
+    """
+    import math
+    from matplotlib.gridspec import GridSpec
+    
+    # Determine grid size
+    n_images = len(images)
+    # One more column for the generated image
+    cols = math.ceil(math.sqrt(n_images)) + 1
+    rows = math.ceil(n_images / (cols - 1))
+    
+    # Create a figure for the grid
+    plt.figure(figsize=(cols * 3, rows * 3))
+    gs = GridSpec(rows, cols)
+    
+    # Generate an image with the current model using the fixed latent vector
+    generated_image = generator.generate_image(latent_vector)
+    
+    # Place the generated image in the top-left corner
+    ax = plt.subplot(gs[0, 0])
+    ax.imshow(generated_image[:, :, 0], cmap='gray')
+    ax.set_title("Generated Image")
+    ax.axis('off')
+    
+    # Add all reference images to the grid
+    for i, (img, info) in enumerate(zip(images, image_info)):
+        row = i // (cols - 1)
+        col = (i % (cols - 1)) + 1  # +1 to skip the first column
+        
+        ax = plt.subplot(gs[row, col])
+        ax.imshow(img[:, :, 0], cmap='gray')
+        ax.set_title(f"{info['filename']}")
+        ax.axis('off')
+    
+    plt.tight_layout()
+    grid_path = os.path.join(output_dir, 'final_comparison_grid.png')
+    plt.savefig(grid_path)
+    plt.close()
+    
+    print(f"Created final comparison grid: {grid_path}")
+
+def calculate_image_similarity(image1, image2):
+    """
+    Calculate similarity between two images.
+    
+    Args:
+        image1: First image as numpy array
+        image2: Second image as numpy array
+        
+    Returns:
+        Similarity score between 0 and 1 (higher means more similar)
+    """
+    if image1 is None or image2 is None:
+        return 0.0
+        
+    # Ensure images have the same shape
+    if image1.shape != image2.shape:
+        return 0.0
+        
+    # Calculate Mean Squared Error (MSE) between the images
+    mse = np.mean((image1 - image2) ** 2)
+    
+    # Convert to similarity (0 to 1, where 1 means identical)
+    # Using exponential decay function to map MSE to similarity
+    similarity = np.exp(-mse * 10)  # Scale factor can be adjusted
+    
+    return similarity
+
+def inject_training_entropy(generator, latent_vector, epoch):
+    """
+    Inject entropy into the training process to escape local minima.
+    
+    Args:
+        generator: The ImageGenerator model
+        latent_vector: Current latent vector being used
+        epoch: Current training epoch
+        
+    Returns:
+        Modified latent vector with added entropy
+    """
+    print(f"\nWARNING: Training appears to have stalled at epoch {epoch}.")
+    print("Injecting entropy to escape possible local minimum...")
+    
+    # Strategy 1: Add noise to the latent vector
+    noise_scale = 0.2 + (0.1 * (epoch // 100))  # Increase noise with epochs
+    noise = np.random.normal(0, noise_scale, latent_vector.shape)
+    new_latent_vector = latent_vector + noise
+    
+    # Strategy 2: Modify model parameters if possible
+    try:
+        if hasattr(generator, 'inject_entropy'):
+            generator.inject_entropy(epoch)
+        else:
+            # Manual intervention - temporarily increase learning rate
+            if hasattr(generator, 'optimizer') and hasattr(generator.optimizer, 'param_groups'):
+                for param_group in generator.optimizer.param_groups:
+                    current_lr = param_group['lr']
+                    # Double the learning rate temporarily
+                    param_group['lr'] = current_lr * 2.0
+                    print(f"Temporarily increased learning rate to {current_lr * 2.0}")
+                    # Schedule to reset learning rate after 5 epochs
+                    def reset_lr():
+                        for pg in generator.optimizer.param_groups:
+                            pg['lr'] = current_lr
+                    threading.Timer(5.0, reset_lr).start()
+    except Exception as e:
+        print(f"Error while injecting entropy into optimizer: {e}")
+    
+    print("Entropy injection complete. Continuing training with modified parameters.")
+    
+    return new_latent_vector
+
 def main():
     """Main training function."""
     args = parse_args()
     
-    # Create output directories
+    # Generate a unique GUID for this training run
+    run_guid = str(uuid.uuid4())
+    print(f"Starting training run with GUID: {run_guid}")
+    
+    # Create run-specific output directories using the GUID
+    run_output_dir = os.path.join(args.output_dir, run_guid)
+    run_preview_dir = os.path.join(args.preview_dir, run_guid)
+    
+    # Create the base directories if they don't exist
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.preview_dir, exist_ok=True)
+    
+    # Create the run-specific directories
+    os.makedirs(run_output_dir, exist_ok=True)
+    os.makedirs(run_preview_dir, exist_ok=True)
+    
+    # Collect system information at the beginning of the run
+    system_info = collect_system_info()
+    
+    # Save run metadata
+    run_metadata = {
+        "guid": run_guid,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "arguments": vars(args),
+        "system_info": system_info
+    }
+    
+    with open(os.path.join(run_output_dir, "run_metadata.json"), 'w') as f:
+        import json
+        json.dump(run_metadata, f, indent=2)
     
     # Configure PyTorch for optimal performance
     if args.num_workers is not None:
@@ -628,7 +1014,7 @@ def main():
     vis_interval = args.visualization_interval or args.save_interval
     
     # Load reference images
-    images, image_info, image_size, num_conditions = load_reference_images(args, args.preview_dir)
+    images, image_info, image_size, num_conditions = load_reference_images(args, run_preview_dir)
     num_images = len(images)
     
     if num_images > 1:
@@ -637,7 +1023,7 @@ def main():
         print("Training with a single reference image")
     
     # Save condition mapping to a JSON file
-    condition_mapping_path = os.path.join(args.output_dir, "condition_mapping.json")
+    condition_mapping_path = os.path.join(run_output_dir, "condition_mapping.json")
     save_condition_mapping(image_info, condition_mapping_path)
     
     # Select a reference image for visualization
@@ -670,37 +1056,30 @@ def main():
     print("Creating initial visualization...")
     visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
     if args.no_async_visualization:
-        initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
+        initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
     else:
-        visualize_func(generator, 0, fixed_latent_vector, vis_target_image, args.preview_dir)
+        visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
     
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
     losses = []
     best_loss = float('inf')
     
-    # Scan for existing model checkpoints in the output directory
-    print(f"Scanning for existing model checkpoints in {args.output_dir}...")
-    for filename in os.listdir(args.output_dir):
-        if filename.startswith("generator_") and filename.endswith(".pt") and filename not in PROTECTED_MODELS:
-            try:
-                # Extract epoch number from filename (format: generator_XXXX.pt)
-                epoch_str = filename.replace("generator_", "").replace(".pt", "")
-                epoch_num = int(epoch_str)
-                
-                # Load the model to get its loss (could be expensive but only done once at startup)
-                model_path = os.path.join(args.output_dir, filename)
-                print(f"Registering existing model: {filename}")
-                
-                # Since we don't have the loss value for old models, use epoch number as proxy
-                # Higher epoch generally means better model (but not always)
-                register_model_checkpoint(model_path, epoch_num, 1.0 / (epoch_num + 1))
-            except Exception as e:
-                print(f"Error processing existing model {filename}: {e}")
+    # Initialize the run statistics dictionary
+    run_stats = {
+        "epoch_losses": [],
+        "epoch_times": [],
+        "best_loss": None,
+        "best_epoch": None,
+        "total_training_time": None
+    }
     
     # Initialize timing statistics
     start_time = time.time()
     epoch_times = []
+    
+    # Save last generated image for entropy comparison (if requested)
+    last_generated_image = None
     
     for epoch in tqdm(range(1, args.epochs + 1)):
         epoch_start = time.time()
@@ -728,6 +1107,10 @@ def main():
         epoch_duration = epoch_end - epoch_start
         epoch_times.append(epoch_duration)
         
+        # Update run statistics
+        run_stats["epoch_losses"].append(float(avg_epoch_loss))
+        run_stats["epoch_times"].append(float(epoch_duration))
+        
         # Print progress
         if epoch % 10 == 0:
             avg_time = sum(epoch_times[-10:]) / min(10, len(epoch_times[-10:]))
@@ -739,10 +1122,10 @@ def main():
         # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
             # Create visualization with the current target image
-            visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, args.preview_dir)
+            generated_image = visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
             
             # Save model checkpoint
-            checkpoint_path = os.path.join(args.output_dir, f"generator_{epoch:04d}.pt")
+            checkpoint_path = os.path.join(run_output_dir, f"generator_{epoch:04d}.pt")
             generator.save_model(checkpoint_path)
             print(f"Saved model checkpoint to {checkpoint_path}")
             
@@ -750,13 +1133,62 @@ def main():
             register_model_checkpoint(checkpoint_path, epoch, avg_epoch_loss)
             
             # Save loss plot
-            save_loss_plot(losses, args.preview_dir)
+            save_loss_plot(losses, run_preview_dir)
+            
+            # Save intermediate run statistics
+            with open(os.path.join(run_output_dir, "run_stats.json"), 'w') as f:
+                import json
+                json.dump(run_stats, f, indent=2)
+                
+            # Check if generated images have changed significantly since last visualization
+            if last_generated_image is not None and generated_image is not None:
+                # Calculate similarity between current and previous generated image
+                similarity = calculate_image_similarity(last_generated_image, generated_image)
+                
+                # Add to run stats
+                if "image_similarities" not in run_stats:
+                    run_stats["image_similarities"] = []
+                run_stats["image_similarities"].append(float(similarity))
+                
+                # Check if images are too similar (training might be stalled)
+                # Or if it's a blank white image (common failure case)
+                is_blank = np.mean(generated_image) > 0.95  # Mostly white
+                
+                if similarity > 0.98 or (is_blank and epoch > vis_interval*2):  # Threshold for detecting stalled training
+                    print(f"WARNING: Generated images have similarity of {similarity:.4f}, training may be stalled.")
+                    
+                    # Log the stalled event
+                    if "entropy_injections" not in run_stats:
+                        run_stats["entropy_injections"] = []
+                    
+                    run_stats["entropy_injections"].append({
+                        "epoch": epoch,
+                        "similarity": float(similarity),
+                        "is_blank": bool(is_blank)
+                    })
+                    
+                    # Inject entropy to escape potential local minimum
+                    fixed_latent_vector = inject_training_entropy(generator, fixed_latent_vector, epoch)
+                    
+                    # Force an immediate new visualization with the modified parameters
+                    # to verify the entropy injection had an effect
+                    new_generated_image = visualize_progress(generator, epoch, fixed_latent_vector, 
+                                                          vis_target_image, run_preview_dir, 
+                                                          prefix=f"entropy_{epoch}", save_comparison=False)
+                    generated_image = new_generated_image
+            
+            # Store current generated image for next comparison
+            last_generated_image = generated_image
         
         # Save the best model based on loss
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
-            best_model_path = os.path.join(args.output_dir, "generator_best.pt")
+            best_model_path = os.path.join(run_output_dir, "generator_best.pt")
             generator.save_model(best_model_path)
+            
+            # Update run statistics for best model
+            run_stats["best_loss"] = float(best_loss)
+            run_stats["best_epoch"] = epoch
     
     # Training complete, show timing information
     total_time = time.time() - start_time
@@ -764,8 +1196,17 @@ def main():
     print(f"Training completed in {total_time/60:.2f} minutes")
     print(f"Average time per epoch: {avg_epoch_time:.3f} seconds")
     
+    # Update final run statistics
+    run_stats["total_training_time"] = float(total_time)
+    run_stats["avg_epoch_time"] = float(avg_epoch_time)
+    
+    # Save final run statistics
+    with open(os.path.join(run_output_dir, "run_stats.json"), 'w') as f:
+        import json
+        json.dump(run_stats, f, indent=2)
+    
     # Save final model
-    final_model_path = os.path.join(args.output_dir, "generator_final.pt")
+    final_model_path = os.path.join(run_output_dir, "generator_final.pt")
     generator.save_model(final_model_path)
     print(f"Training complete! Final model saved to {final_model_path}")
     
@@ -778,20 +1219,40 @@ def main():
     
     # Create a grid comparison of the model's output against all reference images
     if num_images > 1:
-        create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, args.preview_dir)
+        create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, run_preview_dir)
     
     # Regular final visualization with the first image
     final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
-                                   vis_target_image, args.preview_dir, prefix="final", save_comparison=True)
+                                   vis_target_image, run_preview_dir, prefix="final", save_comparison=True)
     
     print(f"Best loss achieved: {best_loss:.6f}")
-    print(f"Progress visualizations saved to {args.preview_dir}")
+    print(f"Progress visualizations saved to {run_preview_dir}")
+    print(f"Run GUID: {run_guid}")
+    print(f"Run output directory: {run_output_dir}")
     
     # Save the final best image as SVG
-    final_svg_path = os.path.join(os.getcwd(), 'data', 'final_output.svg')
-    os.makedirs(os.path.dirname(final_svg_path), exist_ok=True)
+    final_svg_path = os.path.join(run_output_dir, 'final_output.svg')
     save_as_svg(final_image, final_svg_path)
     print(f"Final SVG output saved to {final_svg_path}")
+    
+    # Create a symlink or copy of the latest run folder for easy access
+    latest_run_link = os.path.join(args.output_dir, "latest_run")
+    if os.path.exists(latest_run_link) and os.path.islink(latest_run_link):
+        os.unlink(latest_run_link)
+    elif os.path.exists(latest_run_link):
+        import shutil
+        shutil.rmtree(latest_run_link)
+        
+    try:
+        # Try to create a symbolic link first (works on Unix systems)
+        os.symlink(run_guid, latest_run_link)
+    except (OSError, AttributeError):
+        # On Windows, symlinks might require admin privileges or not be supported
+        # Instead, create a text file with the GUID
+        with open(os.path.join(args.output_dir, "latest_run.txt"), 'w') as f:
+            f.write(f"Latest run GUID: {run_guid}\n")
+            f.write(f"Directory: {run_output_dir}\n")
+            f.write(f"Timestamp: {run_metadata['timestamp']}\n")
     
     # Final cleanup of any excess models if needed
     if len(model_checkpoints) > MAX_MODELS_TO_KEEP:
@@ -799,6 +1260,27 @@ def main():
         cleanup_thread = threading.Thread(target=cleanup_models)
         cleanup_thread.start()
         cleanup_thread.join(timeout=10)  # Wait for up to 10 seconds for cleanup to complete
+    
+    # Save comprehensive run summary
+    run_summary_path = os.path.join(run_output_dir, "run_summary.txt")
+    create_run_summary(run_guid, run_metadata, run_stats, image_info, system_info, run_summary_path)
+    
+    # Save model architecture information
+    model_architecture_path = os.path.join(run_output_dir, "model_architecture.txt")
+    save_model_architecture_info(generator, model_architecture_path)
+    
+    # Create CSV file with epoch-by-epoch statistics
+    csv_path = os.path.join(run_output_dir, "epoch_stats.csv")
+    with open(csv_path, 'w') as f:
+        f.write("Epoch,Loss,Duration(sec)\n")
+        for i, (loss, duration) in enumerate(zip(run_stats["epoch_losses"], run_stats["epoch_times"])):
+            f.write(f"{i+1},{loss},{duration}\n")
+    print(f"Epoch-by-epoch statistics saved to {csv_path}")
+    
+    print(f"All training statistics and metadata saved to {run_output_dir}")
+    print(f"To review this run, see {run_summary_path}")
+    
+    return run_guid
 
 if __name__ == "__main__":
     main()
