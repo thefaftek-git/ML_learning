@@ -20,7 +20,7 @@ class Generator(nn.Module):
     images from a latent vector input and conditional embedding.
     """
     
-    def __init__(self, latent_dim=100, channels=1, output_size=256, num_conditions=3):
+    def __init__(self, latent_dim=100, channels=1, output_size=256, num_conditions=3, tag_dim=0):
         """
         Initialize the generator architecture.
         
@@ -29,6 +29,7 @@ class Generator(nn.Module):
             channels: Number of channels in the output image (1 for grayscale)
             output_size: Size of the output image (width/height)
             num_conditions: Number of different conditional outputs the model can generate
+            tag_dim: Dimension for tag embeddings if using annotations
         """
         super(Generator, self).__init__()
         
@@ -36,6 +37,8 @@ class Generator(nn.Module):
         self.target_height = output_size[0] if isinstance(output_size, tuple) else output_size
         self.target_width = output_size[1] if isinstance(output_size, tuple) else output_size
         self.num_conditions = num_conditions
+        self.has_tag_support = tag_dim > 0
+        self.tag_dim = tag_dim
         
         # Determine the number of upsampling blocks needed
         self.base_size = 8  # Starting size for feature maps
@@ -59,9 +62,17 @@ class Generator(nn.Module):
         # Creates a learnable embedding for each condition (image type)
         self.condition_embedding = nn.Embedding(num_conditions, 32)
         
-        # Initial dense layer to expand from latent space + condition
-        # Increased input dimension to accommodate condition embedding
-        self.fc = nn.Linear(latent_dim + 32, self.base_size * self.base_size * 256)
+        # Embedding layer for tags if tag support is enabled
+        if self.has_tag_support:
+            print(f"Enabling tag support with dimension {tag_dim}")
+            self.tag_embedding_size = 16
+            self.tag_projection = nn.Linear(tag_dim, self.tag_embedding_size)
+            
+            # Initial dense layer to expand from latent space + condition + tags
+            self.fc = nn.Linear(latent_dim + 32 + self.tag_embedding_size, self.base_size * self.base_size * 256)
+        else:
+            # Initial dense layer to expand from latent space + condition
+            self.fc = nn.Linear(latent_dim + 32, self.base_size * self.base_size * 256)
         
         # Create a sequence of upsampling blocks
         layers = []
@@ -79,7 +90,7 @@ class Generator(nn.Module):
         
         self.conv_layers = nn.Sequential(*layers)
     
-    def forward(self, z, condition=None):
+    def forward(self, z, condition=None, tag_tensor=None):
         """
         Forward pass through the generator.
         
@@ -87,6 +98,7 @@ class Generator(nn.Module):
             z: Latent vector input of shape (batch_size, latent_dim)
             condition: Integer tensor specifying which image type to generate
                        (batch_size,), values from 0 to num_conditions-1
+            tag_tensor: Optional tensor of tag embeddings (batch_size, tag_dim)
             
         Returns:
             Generated images of shape (batch_size, channels, height, width)
@@ -100,8 +112,15 @@ class Generator(nn.Module):
         # Convert condition to embedding vector
         condition_vector = self.condition_embedding(condition)
         
-        # Concatenate latent vector with condition embedding
-        combined_input = torch.cat([z, condition_vector], dim=1)
+        if self.has_tag_support and tag_tensor is not None:
+            # Process tag tensor through embedding layer
+            tag_embedding = self.tag_projection(tag_tensor)
+            
+            # Concatenate latent vector, condition embedding, and tag embedding
+            combined_input = torch.cat([z, condition_vector, tag_embedding], dim=1)
+        else:
+            # Concatenate latent vector with condition embedding
+            combined_input = torch.cat([z, condition_vector], dim=1)
         
         # Project and reshape combined input
         x = self.fc(combined_input)
@@ -130,7 +149,8 @@ class ImageGenerator:
     The model can be trained to generate different images based on a condition input.
     """
     
-    def __init__(self, image_size=(128, 128), latent_dim=100, num_conditions=3, device=None, mixed_precision=False):
+    def __init__(self, image_size=(128, 128), latent_dim=100, num_conditions=3, 
+                 device=None, mixed_precision=False, tag_dim=0):
         """
         Initialize the image generator model.
         
@@ -140,11 +160,14 @@ class ImageGenerator:
             num_conditions: Number of different conditional outputs the model can generate
             device: PyTorch device to use (cuda or cpu)
             mixed_precision: Whether to use mixed precision training (FP16)
+            tag_dim: Dimension for tag embeddings if using annotations (0 to disable)
         """
         self.image_size = image_size
         self.latent_dim = latent_dim
         self.num_conditions = num_conditions
         self.mixed_precision = mixed_precision
+        self.tag_dim = tag_dim
+        self.has_annotation_support = tag_dim > 0
         
         # Initialize device (use provided or auto-detect GPU if available)
         if device is None:
@@ -167,7 +190,8 @@ class ImageGenerator:
         self.generator = Generator(
             latent_dim=latent_dim, 
             output_size=image_size,
-            num_conditions=num_conditions
+            num_conditions=num_conditions,
+            tag_dim=tag_dim
         ).to(self.device)
         
         # Initialize optimizer
@@ -187,13 +211,14 @@ class ImageGenerator:
         else:
             self.mixed_precision = False
     
-    def generate_image(self, latent_vector=None, condition_id=0):
+    def generate_image(self, latent_vector=None, condition_id=0, tag_tensor=None):
         """
         Generate an image using the generator model with a specific condition.
         
         Args:
             latent_vector: Input vector for the generator. If None, a random vector is used.
             condition_id: Integer specifying which image type to generate (0 to num_conditions-1)
+            tag_tensor: Optional tensor of tag embeddings (for annotation-based generation)
             
         Returns:
             Generated image as a numpy array
@@ -211,9 +236,16 @@ class ImageGenerator:
             
             # Convert condition to tensor
             condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
+            
+            # Process tag tensor if provided
+            if tag_tensor is not None and self.has_annotation_support:
+                if isinstance(tag_tensor, np.ndarray):
+                    tag_tensor = torch.from_numpy(tag_tensor).float().to(self.device)
+            else:
+                tag_tensor = None
                 
-            # Generate the image with the condition
-            generated_image = self.generator(latent_vector, condition)
+            # Generate the image with the condition and tags
+            generated_image = self.generator(latent_vector, condition, tag_tensor)
             
             # Move to CPU and convert to numpy array
             image_array = generated_image.cpu().numpy()
@@ -225,163 +257,3 @@ class ImageGenerator:
             image_array = (image_array + 1) / 2.0
             
             return image_array
-    
-    def train_step(self, target_image, condition_id, latent_vector=None):
-        """
-        Perform one training step to make the generated image closer to the target.
-        
-        Args:
-            target_image: The target image to aim for
-            condition_id: Integer specifying which image type to generate (0 to num_conditions-1)
-            latent_vector: Input vector for the generator. If None, a random vector is used.
-            
-        Returns:
-            Loss value for this training step
-        """
-        self.generator.train()  # Set to training mode
-        
-        # Create latent vector if not provided
-        if latent_vector is None:
-            batch_size = 1
-            latent_vector = np.random.normal(0, 1, (batch_size, self.latent_dim))
-        elif isinstance(latent_vector, np.ndarray):
-            batch_size = latent_vector.shape[0]
-        else:
-            batch_size = latent_vector.size(0)
-        
-        # Convert latent vector to tensor
-        if isinstance(latent_vector, np.ndarray):
-            latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
-        
-        # Convert condition to tensor and expand to match batch size
-        if isinstance(condition_id, int):
-            condition = torch.full((batch_size,), condition_id, dtype=torch.long, device=self.device)
-        else:
-            condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
-            if condition.size(0) != batch_size:
-                condition = condition.expand(batch_size)
-        
-        # Convert target image to tensor if it's a numpy array
-        if isinstance(target_image, np.ndarray):
-            # Reshape target image to (batch_size, channels, height, width)
-            if len(target_image.shape) == 3 and target_image.shape[2] == 1:
-                # Already has channel dimension but needs transpose
-                target_tensor = torch.from_numpy(target_image).float()
-                target_tensor = target_tensor.permute(2, 0, 1).unsqueeze(0)
-            elif len(target_image.shape) == 2:
-                # Add channel dimension
-                target_tensor = torch.from_numpy(target_image).float().unsqueeze(0).unsqueeze(0)
-            else:
-                # Already in correct format
-                target_tensor = torch.from_numpy(target_image).float()
-                
-            target_tensor = target_tensor.to(self.device)
-        else:
-            target_tensor = target_image
-            
-        # Rescale target to [-1, 1] to match generator output
-        target_tensor = target_tensor * 2 - 1
-        
-        # If target is a single image but we have a batch,
-        # expand target to match batch size
-        if target_tensor.size(0) == 1 and batch_size > 1:
-            target_tensor = target_tensor.expand(batch_size, *target_tensor.shape[1:])
-        
-        # Reset gradients
-        self.optimizer.zero_grad()
-        
-        # Use mixed precision if enabled
-        if self.mixed_precision:
-            with self.autocast():
-                # Generate image with condition
-                generated_image = self.generator(latent_vector, condition)
-                
-                # Calculate loss (mean squared error)
-                loss = F.mse_loss(generated_image, target_tensor)
-                
-            # Backpropagate and update weights with gradient scaling
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            # Standard precision training
-            # Generate image with condition
-            generated_image = self.generator(latent_vector, condition)
-            
-            # Calculate loss (mean squared error)
-            loss = F.mse_loss(generated_image, target_tensor)
-            
-            # Backpropagate and update weights
-            loss.backward()
-            self.optimizer.step()
-        
-        return loss.item()
-    
-    def save_model(self, filepath):
-        """Save the generator model to disk."""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        torch.save({
-            'generator_state_dict': self.generator.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'latent_dim': self.latent_dim,
-            'image_size': self.image_size,
-            'num_conditions': self.num_conditions  # Save number of conditions
-        }, filepath)
-        print(f"Model saved to {filepath}")
-    
-    def load_model(self, filepath):
-        """Load the generator model from disk."""
-        if not os.path.exists(filepath):
-            print(f"Model file not found: {filepath}")
-            return False
-        
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        # Check for architecture changes
-        image_size_changed = False
-        latent_dim_changed = False
-        num_conditions_changed = False
-        
-        if 'image_size' in checkpoint and checkpoint['image_size'] != self.image_size:
-            print(f"Note: Saved model has different image size: {checkpoint['image_size']} vs current: {self.image_size}")
-            image_size_changed = True
-        
-        if 'latent_dim' in checkpoint and checkpoint['latent_dim'] != self.latent_dim:
-            print(f"Updating latent dimension from {self.latent_dim} to {checkpoint['latent_dim']}")
-            self.latent_dim = checkpoint['latent_dim']
-            latent_dim_changed = True
-            
-        if 'num_conditions' in checkpoint:
-            if checkpoint['num_conditions'] != self.num_conditions:
-                print(f"Updating number of conditions from {self.num_conditions} to {checkpoint['num_conditions']}")
-                self.num_conditions = checkpoint['num_conditions']
-                num_conditions_changed = True
-        
-        # Recreate the generator if needed due to architecture changes
-        if latent_dim_changed or image_size_changed or num_conditions_changed:
-            # Use the saved parameters if available, otherwise keep current
-            model_image_size = checkpoint.get('image_size', self.image_size)
-            model_num_conditions = checkpoint.get('num_conditions', self.num_conditions)
-            
-            self.generator = Generator(
-                latent_dim=self.latent_dim,
-                output_size=model_image_size,
-                num_conditions=model_num_conditions
-            ).to(self.device)
-        
-        # Load the state dictionaries
-        try:
-            self.generator.load_state_dict(checkpoint['generator_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Model loaded successfully from {filepath}")
-            return True
-        except Exception as e:
-            print(f"Error loading model state: {e}")
-            print("This might be due to architecture changes. Creating a new model with saved parameters.")
-            # Create a new generator with the right dimensions but don't load weights
-            self.generator = Generator(
-                latent_dim=self.latent_dim,
-                output_size=self.image_size,
-                num_conditions=self.num_conditions
-            ).to(self.device)
-            return False

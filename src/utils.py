@@ -11,6 +11,9 @@ import svgwrite
 from PIL import Image
 import io
 import matplotlib.pyplot as plt
+import json
+from skimage.draw import polygon, rectangle
+import cv2
 
 # Try to import cairosvg but provide a fallback if not available
 CAIRO_AVAILABLE = False
@@ -20,6 +23,377 @@ try:
 except (ImportError, OSError):
     print("Warning: CairoSVG not available. SVG import functionality will be limited.")
     # Continue without cairosvg
+
+# Annotation handling functions
+def find_annotation_file(image_path):
+    """
+    Find an annotation file associated with an image.
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Path to the annotation file if it exists, None otherwise
+    """
+    base_path = os.path.splitext(image_path)[0]
+    anno_path = f"{base_path}.anno.json"
+    
+    if os.path.exists(anno_path):
+        print(f"Found annotation file: {anno_path}")
+        return anno_path
+    return None
+
+def load_annotations(annotation_path):
+    """
+    Load annotations from a JSON file.
+    
+    Args:
+        annotation_path: Path to the annotation JSON file
+        
+    Returns:
+        Dictionary containing the parsed annotations
+    """
+    try:
+        with open(annotation_path, 'r') as f:
+            annotations = json.load(f)
+        return annotations
+    except Exception as e:
+        print(f"Error loading annotation file: {e}")
+        return None
+
+def create_tag_mapping(annotations_list):
+    """
+    Create a mapping from tags to numerical indices.
+    
+    Args:
+        annotations_list: List of annotation dictionaries
+        
+    Returns:
+        Dictionary mapping tag names to indices
+    """
+    # Collect all unique tags from all annotations
+    all_tags = set()
+    
+    for annotations in annotations_list:
+        if not annotations:
+            continue
+            
+        # Global image tags
+        if 'tags' in annotations:
+            for tag in annotations['tags']:
+                all_tags.add(tag)
+                
+        # Region-specific tags
+        if 'regions' in annotations:
+            for region in annotations['regions']:
+                if 'tags' in region:
+                    for tag in region['tags']:
+                        all_tags.add(tag)
+    
+    # Create a mapping from tags to indices
+    tag_mapping = {tag: idx for idx, tag in enumerate(sorted(all_tags))}
+    
+    print(f"Created tag mapping with {len(tag_mapping)} unique tags")
+    return tag_mapping
+
+def regions_to_mask(regions, image_shape):
+    """
+    Convert annotation regions to a binary mask.
+    
+    Args:
+        regions: List of region dictionaries from the annotation file
+        image_shape: Tuple of (height, width) for the target mask
+        
+    Returns:
+        Binary mask as a numpy array with shape (height, width, 1)
+    """
+    height, width = image_shape
+    mask = np.zeros((height, width), dtype=np.float32)
+    
+    for region in regions:
+        region_type = region.get('type', 'unknown')
+        
+        if region_type == 'rectangle':
+            # Rectangle: [x, y, width, height]
+            x, y = int(region['x']), int(region['y'])
+            w, h = int(region['width']), int(region['height'])
+            rr, cc = rectangle((y, x), (y + h - 1, x + w - 1))
+            # Make sure coordinates are within bounds
+            valid_idx = (rr >= 0) & (rr < height) & (cc >= 0) & (cc < width)
+            mask[rr[valid_idx], cc[valid_idx]] = 1
+            
+        elif region_type == 'polygon':
+            # Polygon: list of [x, y] coordinates
+            points = np.array(region['points'])
+            # Separate x and y coordinates
+            row_coords = points[:, 1].astype(int)
+            col_coords = points[:, 0].astype(int)
+            # Draw polygon on mask
+            rr, cc = polygon(row_coords, col_coords, mask.shape)
+            mask[rr, cc] = 1
+            
+        elif region_type == 'brush' or region_type == 'freeform':
+            # Brush strokes or freeform paths
+            # These are typically stored as paths with control points
+            if 'path' in region:
+                # For simplicity, we'll draw lines between consecutive points
+                points = np.array(region['path'])
+                for i in range(len(points) - 1):
+                    pt1 = (int(points[i][0]), int(points[i][1]))
+                    pt2 = (int(points[i+1][0]), int(points[i+1][1]))
+                    cv2.line(mask, pt1, pt2, 1, thickness=region.get('thickness', 1))
+    
+    # Reshape to (height, width, 1)
+    return mask.reshape(height, width, 1)
+
+def create_tag_tensor(annotations, tag_mapping, total_tags):
+    """
+    Create a tensor representing the tags present in the annotations.
+    
+    Args:
+        annotations: Annotations dictionary
+        tag_mapping: Dictionary mapping tag names to indices
+        total_tags: Total number of unique tags
+        
+    Returns:
+        One-hot encoded tensor representing the tags
+    """
+    tag_tensor = np.zeros(total_tags, dtype=np.float32)
+    
+    if not annotations or 'tags' not in annotations:
+        return tag_tensor
+    
+    for tag in annotations['tags']:
+        if tag in tag_mapping:
+            tag_tensor[tag_mapping[tag]] = 1.0
+    
+    return tag_tensor
+
+def create_region_tag_tensor(annotations, tag_mapping, total_tags, image_shape):
+    """
+    Create a tensor representing tags for specific regions in the image.
+    
+    Args:
+        annotations: Annotations dictionary
+        tag_mapping: Dictionary mapping tag names to indices
+        total_tags: Total number of unique tags
+        image_shape: Tuple of (height, width) for the image
+        
+    Returns:
+        Tensor of shape (height, width, total_tags) with tag information per pixel
+    """
+    height, width = image_shape
+    region_tag_tensor = np.zeros((height, width, total_tags), dtype=np.float32)
+    
+    if not annotations or 'regions' not in annotations:
+        return region_tag_tensor
+    
+    for region in annotations['regions']:
+        if 'tags' not in region:
+            continue
+            
+        # Create a mask for this region
+        region_mask = regions_to_mask([region], image_shape)
+        
+        # Set tag values for this region
+        for tag in region['tags']:
+            if tag in tag_mapping:
+                tag_idx = tag_mapping[tag]
+                region_tag_tensor[:, :, tag_idx] = np.maximum(
+                    region_tag_tensor[:, :, tag_idx],
+                    region_mask[:, :, 0]
+                )
+    
+    return region_tag_tensor
+
+def augment_with_annotations(image, annotations, tag_mapping=None):
+    """
+    Apply data augmentation to an image and its annotations together.
+    
+    Args:
+        image: Image as a numpy array with shape (height, width, channels)
+        annotations: Annotations dictionary
+        tag_mapping: Optional dictionary mapping tag names to indices
+        
+    Returns:
+        Tuple of (augmented_image, updated_annotations)
+    """
+    # Simple augmentations that preserve annotations
+    height, width = image.shape[:2]
+    
+    # If no annotations or no regions, just return the original
+    if not annotations or 'regions' not in annotations:
+        return image, annotations
+        
+    # Choose an augmentation randomly
+    augmentation_type = np.random.choice(['none', 'flip_h', 'flip_v', 'rotate_90'])
+    
+    if augmentation_type == 'none':
+        return image, annotations
+    
+    # Create a deep copy of annotations to modify
+    new_annotations = json.loads(json.dumps(annotations))
+    
+    # Apply the selected augmentation
+    if augmentation_type == 'flip_h':
+        # Flip image horizontally
+        augmented_image = np.fliplr(image).copy()
+        
+        # Update region coordinates
+        for region in new_annotations['regions']:
+            region_type = region.get('type', 'unknown')
+            
+            if region_type == 'rectangle':
+                region['x'] = width - region['x'] - region['width']
+                
+            elif region_type == 'polygon':
+                for point in region['points']:
+                    point[0] = width - point[0]
+                    
+            elif region_type == 'brush' or region_type == 'freeform':
+                for point in region['path']:
+                    point[0] = width - point[0]
+                    
+    elif augmentation_type == 'flip_v':
+        # Flip image vertically
+        augmented_image = np.flipud(image).copy()
+        
+        # Update region coordinates
+        for region in new_annotations['regions']:
+            region_type = region.get('type', 'unknown')
+            
+            if region_type == 'rectangle':
+                region['y'] = height - region['y'] - region['height']
+                
+            elif region_type == 'polygon':
+                for point in region['points']:
+                    point[1] = height - point[1]
+                    
+            elif region_type == 'brush' or region_type == 'freeform':
+                for point in region['path']:
+                    point[1] = height - point[1]
+                    
+    elif augmentation_type == 'rotate_90':
+        # Rotate image 90 degrees
+        augmented_image = np.rot90(image).copy()
+        new_height, new_width = augmented_image.shape[:2]
+        
+        # Update region coordinates
+        for region in new_annotations['regions']:
+            region_type = region.get('type', 'unknown')
+            
+            if region_type == 'rectangle':
+                old_x, old_y = region['x'], region['y']
+                old_w, old_h = region['width'], region['height']
+                
+                # In a 90-degree rotation, we swap x,y and width,height
+                region['x'] = height - old_y - old_h
+                region['y'] = old_x
+                region['width'], region['height'] = old_h, old_w
+                
+            elif region_type == 'polygon':
+                for point in region['points']:
+                    old_x, old_y = point
+                    point[0] = height - old_y
+                    point[1] = old_x
+                    
+            elif region_type == 'brush' or region_type == 'freeform':
+                for point in region['path']:
+                    old_x, old_y = point
+                    point[0] = height - old_y
+                    point[1] = old_x
+    
+    # Update image dimensions in annotations
+    new_annotations['width'] = augmented_image.shape[1]
+    new_annotations['height'] = augmented_image.shape[0]
+    
+    return augmented_image, new_annotations
+
+def visualize_annotations(image, annotations, output_path=None, show=False):
+    """
+    Create a visualization of the image with annotations overlaid.
+    
+    Args:
+        image: Image as a numpy array with shape (height, width, channels)
+        annotations: Annotations dictionary
+        output_path: Path to save the visualization (optional)
+        show: Whether to display the visualization (default: False)
+        
+    Returns:
+        Visualization image as numpy array
+    """
+    if image.ndim == 2:
+        # Convert grayscale to RGB
+        viz_image = np.stack([image] * 3, axis=-1)
+    elif image.shape[-1] == 1:
+        # Convert single-channel to RGB
+        viz_image = np.concatenate([image] * 3, axis=-1)
+    else:
+        # Already RGB
+        viz_image = image.copy()
+    
+    # Make sure image is in proper range for visualization
+    if viz_image.max() <= 1.0:
+        viz_image = viz_image * 255
+    viz_image = viz_image.astype(np.uint8)
+    
+    # Draw annotations
+    if annotations and 'regions' in annotations:
+        for region in annotations['regions']:
+            region_type = region.get('type', 'unknown')
+            
+            # Choose a random color for this region
+            color = np.random.randint(0, 255, 3).tolist()
+            
+            if region_type == 'rectangle':
+                x, y = int(region['x']), int(region['y'])
+                w, h = int(region['width']), int(region['height'])
+                cv2.rectangle(viz_image, (x, y), (x+w, y+h), color, 2)
+                
+                # Draw tags if present
+                if 'tags' in region:
+                    tag_text = ', '.join(region['tags'])
+                    cv2.putText(viz_image, tag_text, (x, y-5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+            elif region_type == 'polygon':
+                points = np.array(region['points'], dtype=np.int32)
+                cv2.polylines(viz_image, [points], True, color, 2)
+                
+                # Draw tags if present
+                if 'tags' in region and len(points) > 0:
+                    # Place tag text near the first point
+                    x, y = points[0]
+                    tag_text = ', '.join(region['tags'])
+                    cv2.putText(viz_image, tag_text, (x, y-5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+            elif region_type == 'brush' or region_type == 'freeform':
+                if 'path' in region:
+                    points = np.array(region['path'], dtype=np.int32)
+                    thickness = region.get('thickness', 1)
+                    cv2.polylines(viz_image, [points], False, color, thickness)
+    
+    # Draw global tags if present
+    if annotations and 'tags' in annotations:
+        global_tags = ', '.join(annotations['tags'])
+        cv2.putText(viz_image, f"Global: {global_tags}", (10, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Save visualization if path provided
+    if output_path:
+        cv2.imwrite(output_path, cv2.cvtColor(viz_image, cv2.COLOR_RGB2BGR))
+        print(f"Saved annotation visualization to {output_path}")
+    
+    # Show visualization if requested
+    if show:
+        plt.figure(figsize=(10, 10))
+        plt.imshow(viz_image)
+        plt.axis('off')
+        plt.title("Image with Annotations")
+        plt.show()
+    
+    return viz_image
 
 def load_image(image_path, size=(128, 128)):
     """
@@ -53,317 +427,15 @@ def load_image(image_path, size=(128, 128)):
     else:
         raise ValueError(f"Unsupported file format: {file_ext}")
 
-def create_blank_image(size=(128, 128)):
-    """
-    Create a blank white image as a fallback when SVG loading isn't available.
-    
-    Args:
-        size: Tuple (height, width) for the desired image size
-        
-    Returns:
-        Numpy array with shape (height, width, 1) containing a white image
-    """
-    # Create a white image
-    image_array = np.ones((size[0], size[1], 1), dtype=np.float32)
-    return image_array
-
-def load_raster_image(image_path, size=(128, 128)):
-    """
-    Load a raster image (JPG, PNG) and convert it to a numpy array.
-    
-    Args:
-        image_path: Path to the raster image file
-        size: Tuple (height, width) for the desired image size
-        
-    Returns:
-        Numpy array with shape (height, width, 1) containing the image data
-    """
-    # Open the image with PIL and convert to grayscale
-    image = Image.open(image_path).convert('L')
-    
-    # Resize the image to the desired dimensions
-    image = image.resize(size, Image.Resampling.LANCZOS)
-    
-    # Convert to numpy array and normalize to [0, 1]
-    image_array = np.array(image).astype(np.float32) / 255.0
-    
-    # Reshape to (height, width, 1)
-    image_array = image_array.reshape(size[0], size[1], 1)
-    
-    return image_array
-
-def load_svg_image(svg_path, size=(128, 128), invert_colors=True):
-    """
-    Load an SVG image and convert it to a numpy array.
-    
-    Args:
-        svg_path: Path to the SVG file
-        size: Tuple (height, width) for the desired image size
-        invert_colors: Whether to invert colors for dark SVGs with filled paths
-        
-    Returns:
-        Numpy array with shape (height, width, 1) containing the image data
-    """
-    # This function requires cairosvg
-    if not CAIRO_AVAILABLE:
-        print(f"Warning: CairoSVG not available, cannot load SVG file {svg_path}")
-        return create_blank_image(size)
-    
-    # Check if the file exists
-    if not os.path.exists(svg_path):
-        raise FileNotFoundError(f"SVG file not found at {svg_path}")
-    
-    try:
-        # Read SVG file to check if it contains dark fills
-        with open(svg_path, 'r') as file:
-            svg_content = file.read()
-            
-        # Convert SVG to PNG using cairosvg
-        png_data = cairosvg.svg2png(url=svg_path, output_width=size[1], output_height=size[0])
-        
-        # Load the PNG data into a PIL Image
-        image = Image.open(io.BytesIO(png_data)).convert('L')  # Convert to grayscale
-        
-        # Check if SVG contains dark fills by looking at content and image statistics
-        if invert_colors and ('fill="#' in svg_content.lower() or 'fill="rgb' in svg_content.lower()):
-            # Calculate average brightness
-            avg_brightness = np.mean(np.array(image))
-            
-            # If the image is predominantly dark (filled shapes), invert it to get white shapes on black background
-            if avg_brightness < 128:
-                print(f"Detected dark fill in SVG {svg_path}, inverting colors for wireframe extraction")
-                image = Image.fromarray(255 - np.array(image))
-        
-        # Convert to numpy array and normalize to [0, 1]
-        image_array = np.array(image).astype(np.float32) / 255.0
-        
-        # Reshape to (height, width, 1)
-        image_array = image_array.reshape(size[0], size[1], 1)
-        
-        return image_array
-    except Exception as e:
-        print(f"Error loading SVG image: {e}")
-        return create_blank_image(size)
-
-def load_svg_simplified(svg_path, size=(256, 256)):
-    """
-    A simplified SVG loader that extracts path data and renders to a numpy array
-    without requiring CairoSVG.
-    
-    Args:
-        svg_path: Path to the SVG file
-        size: Tuple (height, width) for the desired image size
-        
-    Returns:
-        Numpy array with shape (height, width, 1) containing the image data
-    """
-    import re
-    import math
-    from xml.dom import minidom
-    
-    try:
-        print(f"Loading SVG file with simplified loader: {svg_path}")
-        # Parse the SVG file
-        doc = minidom.parse(svg_path)
-        
-        # Create a blank canvas
-        height, width = size
-        canvas = np.ones((height, width), dtype=np.float32)
-        
-        # Get SVG dimensions
-        svg_elem = doc.getElementsByTagName('svg')[0]
-        svg_width = float(svg_elem.getAttribute('width') or 1000)
-        svg_height = float(svg_elem.getAttribute('height') or 1000)
-        print(f"SVG dimensions: {svg_width}x{svg_height}")
-        
-        # Scaling factors to fit the SVG into our canvas
-        scale_x = width / svg_width
-        scale_y = height / svg_height
-        scale = min(scale_x, scale_y)
-        print(f"Using scale factor: {scale} (from {scale_x}, {scale_y})")
-        
-        # Process all path elements in the SVG
-        paths = doc.getElementsByTagName('path')
-        print(f"Found {len(paths)} path elements in SVG")
-        
-        # If we didn't find any paths, return a blank image
-        if not paths:
-            print(f"No path elements found in SVG: {svg_path}")
-            return create_blank_image(size)
-        
-        # Process each path element
-        for path in paths:
-            path_str = path.getAttribute('d')
-            
-            # Extract fill color if present
-            fill_color = "#141d27"  # Default fill matching the one in your SVG
-            style_attr = path.getAttribute('style')
-            if 'fill:' in style_attr:
-                fill_match = re.search(r'fill:(#[0-9a-fA-F]{6}|#[0-9a-fA-F]{3}|rgb\([^)]+\)|[a-zA-Z]+)', style_attr)
-                if fill_match:
-                    fill_color = fill_match.group(1)
-            elif path.hasAttribute('fill'):
-                fill_color = path.getAttribute('fill')
-            
-            # Determine if we should invert based on fill color (dark fill means we should)
-            invert = fill_color.lower() in ['#000000', '#000', 'black', '#141d27']
-            fill_value = 0.0 if invert else 1.0
-            
-            # Extract coordinates from the path
-            coords = re.findall(r'([0-9.-]+)[, ]([0-9.-]+)', path_str)
-            
-            # Draw path points onto canvas
-            for i in range(len(coords) - 1):
-                x1, y1 = float(coords[i][0]) * scale, float(coords[i][1]) * scale
-                x2, y2 = float(coords[i+1][0]) * scale, float(coords[i+1][1]) * scale
-                
-                # Simple line drawing algorithm
-                line_points = bresenham_line(int(x1), int(y1), int(x2), int(y2))
-                for x, y in line_points:
-                    if 0 <= x < width and 0 <= y < height:
-                        # Draw the line
-                        canvas[y, x] = fill_value
-        
-        # Clean up
-        doc.unlink()
-        
-        # Invert the image if we have a dark background
-        if np.mean(canvas) < 0.5:
-            print(f"Detected dark background in SVG {svg_path}, inverting colors")
-            canvas = 1.0 - canvas
-            
-        # Reshape to match expected format (height, width, 1)
-        return canvas.reshape(height, width, 1)
-    except Exception as e:
-        print(f"Error loading SVG with simplified loader: {e}")
-        import traceback
-        traceback.print_exc()
-        return create_blank_image(size)
-
-def bresenham_line(x0, y0, x1, y1):
-    """
-    Bresenham's line algorithm to get all points on a line.
-    """
-    points = []
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-    
-    while True:
-        points.append((x0, y0))
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 > -dy:
-            if x0 == x1:
-                break
-            err -= dy
-            x0 += sx
-        if e2 < dx:
-            if y0 == y1:
-                break
-            err += dx
-            y0 += sy
-    
-    return points
-
-def save_as_svg(image_array, output_path, threshold=0.5):
-    """
-    Convert a numpy array to an SVG wireframe image.
-    
-    Args:
-        image_array: numpy array with shape (height, width, 1) containing the image data
-        output_path: Path where to save the SVG file
-        threshold: Threshold for binarizing the image (default: 0.5)
-    """
-    # Get image dimensions
-    height, width = image_array.shape[0], image_array.shape[1]
-    
-    # Create SVG drawing
-    dwg = svgwrite.Drawing(output_path, profile='tiny', size=(f"{width}px", f"{height}px"))
-    
-    # Binarize the image using the threshold
-    binary_image = (image_array[:, :, 0] > threshold).astype(np.uint8)
-    
-    # Find edges using a simple approach
-    edges = np.zeros_like(binary_image)
-    for i in range(1, height-1):
-        for j in range(1, width-1):
-            # If the pixel value differs from any of its neighbors, it's an edge
-            if binary_image[i, j] != binary_image[i-1, j] or \
-               binary_image[i, j] != binary_image[i+1, j] or \
-               binary_image[i, j] != binary_image[i, j-1] or \
-               binary_image[i, j] != binary_image[i, j+1]:
-                edges[i, j] = 1
-    
-    # Convert edges to line segments
-    for i in range(height):
-        for j in range(width-1):
-            if edges[i, j] == 1 and edges[i, j+1] == 1:
-                dwg.add(dwg.line((j, i), (j+1, i), stroke='black', stroke_width=1))
-    
-    for j in range(width):
-        for i in range(height-1):
-            if edges[i, j] == 1 and edges[i+1, j] == 1:
-                dwg.add(dwg.line((j, i), (j, i+1), stroke='black', stroke_width=1))
-    
-    # Save the SVG file
-    dwg.save()
-
-def create_placeholder_svg(output_path, size=(128, 128), shape_type="circle"):
-    """
-    Create a simple placeholder SVG file with a basic shape.
-    
-    Args:
-        output_path: Path where to save the SVG file
-        size: Tuple (height, width) for the desired image size
-        shape_type: Type of shape to create (circle, square, triangle)
-    """
-    width, height = size
-    dwg = svgwrite.Drawing(output_path, profile='tiny', size=(f"{width}px", f"{height}px"))
-    
-    # Set background
-    dwg.add(dwg.rect(insert=(0, 0), size=(width, height), fill='white'))
-    
-    if shape_type == "circle":
-        # Draw a circle in the center
-        radius = min(width, height) // 4
-        dwg.add(dwg.circle(center=(width//2, height//2), r=radius, stroke='black',
-                          stroke_width=2, fill='none'))
-    
-    elif shape_type == "square":
-        # Draw a square in the center
-        side = min(width, height) // 3
-        x = (width - side) // 2
-        y = (height - side) // 2
-        dwg.add(dwg.rect(insert=(x, y), size=(side, side), stroke='black',
-                        stroke_width=2, fill='none'))
-    
-    elif shape_type == "triangle":
-        # Draw a triangle in the center
-        side = min(width, height) // 2
-        x_center = width // 2
-        y_center = height // 2
-        dwg.add(dwg.polygon(points=[
-            (x_center, y_center - side//2),
-            (x_center - side//2, y_center + side//2),
-            (x_center + side//2, y_center + side//2)
-        ], stroke='black', stroke_width=2, fill='none'))
-    
-    # Save the SVG file
-    dwg.save()
-    print(f"Created placeholder SVG at {output_path}")
-
-def preprocess_reference_image(reference_path, output_dir, size=None, show_preview=True, preserve_dimensions=True):
+def preprocess_reference_image(reference_path, output_dir, size=None, show_preview=True, preserve_dimensions=True, load_annotations=True):
     """
     Preprocess the reference image for training.
     
     This function:
     1. Loads the reference image
     2. Converts it to grayscale if it's not already
-    3. Saves a visualization of the processed image
+    3. Checks for and loads associated annotation files
+    4. Saves a visualization of the processed image (with annotations if available)
     
     Args:
         reference_path: Path to the reference image
@@ -372,11 +444,13 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
              If None, uses original dimensions.
         show_preview: Whether to save a preview visualization
         preserve_dimensions: Whether to preserve the original aspect ratio
+        load_annotations: Whether to look for annotation files
         
     Returns:
-        Tuple of (processed_image, original_dimensions) where:
+        Tuple of (processed_image, original_dimensions, annotations) where:
             - processed_image is a numpy array with shape (height, width, 1)
             - original_dimensions is a tuple (height, width)
+            - annotations is a dictionary with annotation data (or None if no annotations found)
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -413,6 +487,19 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
         # Use standard image loading for other formats
         processed_image = load_image(reference_path, size)
     
+    # Look for annotation file if requested
+    annotations = None
+    if load_annotations:
+        annotation_path = find_annotation_file(reference_path)
+        if annotation_path:
+            annotations = load_annotations(annotation_path)
+            print(f"Loaded annotations for {os.path.basename(reference_path)}")
+            
+            # Visualize annotations if preview is requested
+            if show_preview and annotations:
+                viz_path = os.path.join(output_dir, 'reference_with_annotations.png')
+                visualize_annotations(processed_image, annotations, output_path=viz_path)
+    
     if show_preview:
         try:
             # Save the processed reference image for visualization
@@ -433,68 +520,4 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
     save_as_svg(processed_image, svg_path)
     print(f"Saved processed reference as SVG to {svg_path}")
     
-    return processed_image, original_dimensions
-
-def get_image_dimensions(image_path):
-    """
-    Get the original dimensions of an image file.
-    
-    Args:
-        image_path: Path to the image file
-        
-    Returns:
-        Tuple (height, width) of the original image dimensions
-    """
-    # Check if the file exists
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image file not found at {image_path}")
-    
-    # Handle based on file extension
-    file_ext = os.path.splitext(image_path)[1].lower()
-    
-    if file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-        # For raster image formats (JPG, PNG, etc.)
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-                return (height, width)
-        except Exception as e:
-            print(f"Error getting image dimensions: {e}")
-            return (256, 256)  # Default fallback size
-    elif file_ext == '.svg':
-        # For SVG images
-        try:
-            from xml.dom import minidom
-            doc = minidom.parse(image_path)
-            svg_elem = doc.getElementsByTagName('svg')[0]
-            
-            # Try to get width and height from SVG attributes
-            width = svg_elem.getAttribute('width')
-            height = svg_elem.getAttribute('height')
-            
-            # Parse dimensions, removing any units like 'px'
-            if width and height:
-                width = float(''.join(c for c in width if c.isdigit() or c == '.'))
-                height = float(''.join(c for c in height if c.isdigit() or c == '.'))
-                doc.unlink()
-                return (int(height), int(width))
-            
-            # If no explicit dimensions, try to find a viewBox
-            viewbox = svg_elem.getAttribute('viewBox')
-            if viewbox:
-                parts = viewbox.split()
-                if len(parts) == 4:
-                    width = float(parts[2])
-                    height = float(parts[3])
-                    doc.unlink()
-                    return (int(height), int(width))
-            
-            doc.unlink()
-            return (256, 256)  # Default size for SVGs without dimensions
-        except Exception as e:
-            print(f"Error getting SVG dimensions: {e}")
-            return (256, 256)  # Default fallback size
-    else:
-        # Unsupported format
-        print(f"Unsupported format for dimension detection: {file_ext}")
-        return (256, 256)  # Default fallback size
+    return processed_image, original_dimensions, annotations

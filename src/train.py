@@ -342,6 +342,7 @@ def load_reference_images(args, preview_dir):
     Load reference images based on command-line arguments.
     
     This function handles both single image and directory-based image loading.
+    It also checks for and loads associated annotation files.
     
     Args:
         args: Command-line arguments
@@ -353,9 +354,12 @@ def load_reference_images(args, preview_dir):
         - List of image info dictionaries (each containing filename, dimensions, condition_id, etc.)
         - Common image dimensions to use (height, width)
         - Number of conditions (number of unique images)
+        - Dictionary mapping tag names to indices (or None if no annotations)
+        - Total number of unique tags across all annotations
     """
     images = []
     image_info = []
+    all_annotations = []
     
     # Determine if we're loading from a directory or a single file
     if args.reference_dir:
@@ -381,7 +385,7 @@ def load_reference_images(args, preview_dir):
         
         # Get dimensions from the first image to use as reference
         first_image_path = image_files[0]
-        _, original_dimensions = preprocess_reference_image(
+        _, original_dimensions, _ = preprocess_reference_image(
             first_image_path, preview_dir, size=None, show_preview=False
         )
         original_height, original_width = original_dimensions
@@ -409,9 +413,16 @@ def load_reference_images(args, preview_dir):
             print(f"Processing: {filename} (Condition ID: {condition_id})")
             
             # Process the image using the target dimensions
-            processed_img, _ = preprocess_reference_image(
+            processed_img, _, annotations = preprocess_reference_image(
                 img_path, preview_dir, size=target_dimensions, show_preview=False
             )
+            
+            # Store annotations if found
+            if annotations:
+                print(f"Found annotations for {filename}")
+                all_annotations.append(annotations)
+            else:
+                all_annotations.append(None)
             
             # Ensure all images have the same dimensions
             if processed_img.shape[0] != height or processed_img.shape[1] != width:
@@ -423,7 +434,8 @@ def load_reference_images(args, preview_dir):
                 'filename': filename,
                 'path': img_path,
                 'original_dimensions': original_dimensions,
-                'condition_id': condition_id  # Store condition ID with image info
+                'condition_id': condition_id,  # Store condition ID with image info
+                'has_annotations': annotations is not None  # Track if this image has annotations
             })
             
         # Use a special preview image that includes all reference images
@@ -441,14 +453,14 @@ def load_reference_images(args, preview_dir):
         # Get target dimensions
         if args.image_size is None and args.width is None and args.height is None:
             # Use original dimensions from the reference image
-            processed_img, original_dimensions = preprocess_reference_image(
+            processed_img, original_dimensions, annotations = preprocess_reference_image(
                 reference_path, preview_dir, size=None
             )
             height, width = original_dimensions
             print(f"Using reference image's original dimensions: {height}x{width}")
         else:
             # Calculate target dimensions based on arguments
-            _, original_dimensions = preprocess_reference_image(
+            _, original_dimensions, _ = preprocess_reference_image(
                 reference_path, preview_dir, size=None, show_preview=False
             )
             original_height, original_width = original_dimensions
@@ -460,9 +472,16 @@ def load_reference_images(args, preview_dir):
             height, width = target_dimensions
             
             # Process the image using the target dimensions
-            processed_img, _ = preprocess_reference_image(
+            processed_img, _, annotations = preprocess_reference_image(
                 reference_path, preview_dir, size=target_dimensions
             )
+        
+        # Store annotations if found
+        if annotations:
+            print(f"Found annotations for {os.path.basename(reference_path)}")
+            all_annotations.append(annotations)
+        else:
+            all_annotations.append(None)
         
         # Add the single image to our lists with condition_id = 0
         images.append(processed_img)
@@ -470,13 +489,47 @@ def load_reference_images(args, preview_dir):
             'filename': os.path.basename(reference_path),
             'path': reference_path,
             'original_dimensions': original_dimensions,
-            'condition_id': 0  # Single image always uses condition ID 0
+            'condition_id': 0,  # Single image always uses condition ID 0
+            'has_annotations': annotations is not None  # Track if this image has annotations
         })
         
         # Only one condition for a single image
         num_conditions = 1
     
-    return images, image_info, (height, width), num_conditions
+    # Create tag mapping if any annotations were found
+    tag_mapping = None
+    total_tags = 0
+    
+    if any(anno is not None for anno in all_annotations):
+        print("Creating tag mapping from annotations...")
+        tag_mapping = create_tag_mapping(all_annotations)
+        total_tags = len(tag_mapping)
+        
+        # Save tag mapping for future reference
+        tag_mapping_path = os.path.join(os.path.dirname(preview_dir), "tag_mapping.json")
+        with open(tag_mapping_path, 'w') as f:
+            json.dump({
+                "tag_to_index": tag_mapping,
+                "total_tags": total_tags
+            }, f, indent=2)
+        print(f"Saved tag mapping with {total_tags} tags to {tag_mapping_path}")
+        
+        # Update image_info with annotation details
+        for i, (info, anno) in enumerate(zip(image_info, all_annotations)):
+            if anno is not None:
+                # Count regions and tags
+                region_count = len(anno.get('regions', []))
+                tag_count = len(anno.get('tags', []))
+                region_tag_count = sum(len(region.get('tags', [])) for region in anno.get('regions', []))
+                
+                # Store counts in image_info
+                image_info[i].update({
+                    'region_count': region_count,
+                    'global_tag_count': tag_count,
+                    'region_tag_count': region_tag_count
+                })
+    
+    return images, image_info, (height, width), num_conditions, tag_mapping, total_tags
 
 def calculate_target_dimensions(args, original_height, original_width, preview_dir):
     """
@@ -621,31 +674,32 @@ def create_reference_grid(images, image_info, output_dir):
     
     print(f"Created reference grid visualization: {grid_path}")
 
-def select_target_image(images, image_info, epoch, selection_method='random'):
+def select_target_image(images, image_info, all_annotations, epoch, selection_method='random'):
     """
     Select a target image for the current training epoch.
     
     Args:
         images: List of processed images
         image_info: List of image info dictionaries
+        all_annotations: List of annotation dictionaries corresponding to images
         epoch: Current training epoch
         selection_method: How to select the image ('random' or 'sequential')
         
     Returns:
-        Tuple of (selected image, image information)
+        Tuple of (selected image, image information, annotations)
     """
     if len(images) == 1:
         # If only one image, always return it
-        return images[0], image_info[0]
+        return images[0], image_info[0], all_annotations[0] if all_annotations else None
     
     if selection_method == 'random':
         # Randomly select an image
         idx = np.random.randint(0, len(images))
-        return images[idx], image_info[idx]
+        return images[idx], image_info[idx], all_annotations[idx] if all_annotations else None
     else:
         # Sequential selection - cycle through images based on epoch
         idx = epoch % len(images)
-        return images[idx], image_info[idx]
+        return images[idx], image_info[idx], all_annotations[idx] if all_annotations else None
 
 def visualize_progress(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False):
     """Save a visualization of training progress."""
@@ -1013,9 +1067,39 @@ def main():
     # Set visualization interval (if specified separately from save interval)
     vis_interval = args.visualization_interval or args.save_interval
     
-    # Load reference images
-    images, image_info, image_size, num_conditions = load_reference_images(args, run_preview_dir)
+    # Load reference images and annotations if available
+    images, image_info, image_size, num_conditions, tag_mapping, total_tags = load_reference_images(args, run_preview_dir)
     num_images = len(images)
+    
+    # Get all annotations for the loaded images
+    all_annotations = []
+    for info in image_info:
+        if info.get('has_annotations', False):
+            annotation_path = find_annotation_file(info['path'])
+            if annotation_path:
+                annotations = load_annotations(annotation_path)
+                all_annotations.append(annotations)
+            else:
+                all_annotations.append(None)
+        else:
+            all_annotations.append(None)
+    
+    # Report annotation statistics
+    annotated_count = sum(1 for anno in all_annotations if anno is not None)
+    if annotated_count > 0:
+        print(f"Using annotations for {annotated_count} of {num_images} images")
+        print(f"Found {total_tags} unique tags in annotations")
+        
+        # Store annotation metadata
+        with open(os.path.join(run_output_dir, "annotation_metadata.json"), 'w') as f:
+            import json
+            json.dump({
+                "annotated_images": annotated_count,
+                "total_images": num_images,
+                "total_unique_tags": total_tags,
+            }, f, indent=2)
+    else:
+        print("No annotations found for any images. Training without annotation data.")
     
     if num_images > 1:
         print(f"Training with {num_images} reference images using '{args.image_selection}' selection strategy")
@@ -1027,17 +1111,29 @@ def main():
     save_condition_mapping(image_info, condition_mapping_path)
     
     # Select a reference image for visualization
-    vis_target_image = images[0]  # Use the first image for visualization
+    vis_target_image, vis_target_info, vis_annotations = select_target_image(
+        images, image_info, all_annotations, 0, args.image_selection
+    )
     height, width = image_size
     
     # Initialize the generator model
+    # If we have annotations, use tag information to set up model parameters
+    has_annotations = any(anno is not None for anno in all_annotations)
     print("Initializing generator model...")
-    generator = ImageGenerator(
-        image_size=image_size,
-        latent_dim=args.latent_dim,
-        device=device,
-        mixed_precision=args.mixed_precision
-    )
+    
+    generator_args = {
+        'image_size': image_size,
+        'latent_dim': args.latent_dim,
+        'device': device,
+        'mixed_precision': args.mixed_precision,
+    }
+    
+    # Add annotation-related parameters if available
+    if has_annotations and total_tags > 0:
+        generator_args['tag_dim'] = total_tags
+        print(f"Configuring model with tag dimension of {total_tags}")
+    
+    generator = ImageGenerator(**generator_args)
     
     # Apply memory optimizations if requested
     if not args.no_optimize_memory:
@@ -1059,6 +1155,12 @@ def main():
         initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
     else:
         visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
+        
+    # If annotations exist for the visualization target, create an annotated visualization
+    if vis_annotations:
+        viz_path = os.path.join(run_preview_dir, 'initial_with_annotations.png')
+        from utils import visualize_annotations
+        visualize_annotations(vis_target_image, vis_annotations, output_path=viz_path)
     
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
@@ -1071,7 +1173,8 @@ def main():
         "epoch_times": [],
         "best_loss": None,
         "best_epoch": None,
-        "total_training_time": None
+        "total_training_time": None,
+        "annotation_usage": has_annotations
     }
     
     # Initialize timing statistics
@@ -1087,15 +1190,61 @@ def main():
         epoch_loss = 0.0
         # Run multiple training steps per epoch to improve GPU utilization
         for step in range(args.steps_per_epoch):
-            # Select target image for this step
-            target_image, target_info = select_target_image(images, image_info, epoch * step, args.image_selection)
+            # Select target image and annotations for this step
+            target_image, target_info, target_annotations = select_target_image(
+                images, image_info, all_annotations, epoch * step, args.image_selection
+            )
             
             # Create a batch of latent vectors for better GPU utilization
             latent_vector = np.random.normal(0, 1, (args.batch_size, args.latent_dim))
             
-            # Train with the full batch - pass the condition ID from the target info
+            # Get condition ID from the target info
             condition_id = target_info['condition_id']
-            step_loss = generator.train_step(target_image, condition_id, latent_vector)
+            
+            # Apply data augmentation if annotations are available
+            if target_annotations and (step % 2 == 0):  # Only augment every other step
+                from utils import augment_with_annotations
+                aug_image, aug_annotations = augment_with_annotations(
+                    target_image, target_annotations, tag_mapping
+                )
+                target_image = aug_image
+            
+            # Create annotation masks and tensors if annotations are available
+            tag_tensor = None
+            region_masks = None
+            
+            if has_annotations and target_annotations and hasattr(generator, 'train_with_annotations'):
+                from utils import create_tag_tensor, regions_to_mask, create_region_tag_tensor
+                
+                # Create global tag tensor
+                tag_tensor = create_tag_tensor(target_annotations, tag_mapping, total_tags)
+                
+                # Create region masks if regions exist
+                if 'regions' in target_annotations and len(target_annotations['regions']) > 0:
+                    region_masks = regions_to_mask(target_annotations['regions'], target_image.shape[:2])
+                    
+                    # Create region-specific tag tensor
+                    region_tag_tensor = create_region_tag_tensor(
+                        target_annotations, tag_mapping, total_tags, target_image.shape[:2]
+                    )
+                    
+                    # Train with full annotation data
+                    step_loss = generator.train_with_annotations(
+                        target_image, condition_id, latent_vector,
+                        tag_tensor=tag_tensor,
+                        region_masks=region_masks,
+                        region_tag_tensor=region_tag_tensor
+                    )
+                else:
+                    # Train with just global tags
+                    step_loss = generator.train_with_annotations(
+                        target_image, condition_id, latent_vector,
+                        tag_tensor=tag_tensor
+                    )
+            else:
+                # Standard training without annotations
+                step_loss = generator.train_step(target_image, condition_id, latent_vector)
+                
             epoch_loss += step_loss
             
         # Calculate average loss for this epoch
@@ -1123,6 +1272,12 @@ def main():
         if epoch % vis_interval == 0 or epoch == args.epochs:
             # Create visualization with the current target image
             generated_image = visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
+            
+            # If annotations are available, create a visualization with them
+            if vis_annotations and epoch % (vis_interval * 2) == 0:
+                from utils import visualize_annotations
+                viz_path = os.path.join(run_preview_dir, f'annotated_{epoch:04d}.png')
+                visualize_annotations(vis_target_image, vis_annotations, output_path=viz_path)
             
             # Save model checkpoint
             checkpoint_path = os.path.join(run_output_dir, f"generator_{epoch:04d}.pt")
@@ -1224,6 +1379,12 @@ def main():
     # Regular final visualization with the first image
     final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
                                    vis_target_image, run_preview_dir, prefix="final", save_comparison=True)
+    
+    # If annotations are available, create a final annotated visualization
+    if vis_annotations:
+        from utils import visualize_annotations
+        viz_path = os.path.join(run_preview_dir, f'final_annotated.png')
+        visualize_annotations(vis_target_image, vis_annotations, output_path=viz_path)
     
     print(f"Best loss achieved: {best_loss:.6f}")
     print(f"Progress visualizations saved to {run_preview_dir}")
