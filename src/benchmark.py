@@ -585,6 +585,7 @@ def main():
             'best_throughput': {
                 'batch_size': int(best_throughput['batch_size']),
                 'steps_per_epoch': int(best_throughput['steps_per_epoch']),
+                'num_threads': int(best_throughput['num_threads']),
                 'throughput': float(best_throughput['throughput']),
                 'gpu_utilization': float(best_throughput['gpu_utilization']) if best_throughput['gpu_utilization'] is not None else None,
                 'gpu_memory_percent': float(best_throughput['gpu_memory_percent']) if best_throughput['gpu_memory_percent'] is not None else None
@@ -595,6 +596,7 @@ def main():
             recommendations['best_gpu_utilization'] = {
                 'batch_size': int(best_util['batch_size']),
                 'steps_per_epoch': int(best_util['steps_per_epoch']),
+                'num_threads': int(best_util['num_threads']),
                 'throughput': float(best_util['throughput']),
                 'gpu_utilization': float(best_util['gpu_utilization']) if best_util['gpu_utilization'] is not None else None,
                 'gpu_memory_percent': float(best_util['gpu_memory_percent']) if best_util['gpu_memory_percent'] is not None else None
@@ -604,6 +606,7 @@ def main():
             recommendations['best_composite_score'] = {
                 'batch_size': int(best_composite['batch_size']),
                 'steps_per_epoch': int(best_composite['steps_per_epoch']),
+                'num_threads': int(best_composite['num_threads']),
                 'throughput': float(best_composite['throughput']),
                 'gpu_utilization': float(best_composite['gpu_utilization']) if best_composite['gpu_utilization'] is not None else None,
                 'gpu_memory_percent': float(best_composite['gpu_memory_percent']) if best_composite['gpu_memory_percent'] is not None else None,
@@ -636,6 +639,7 @@ def main():
             f.write("### Best Throughput Configuration\n\n")
             f.write(f"- Batch Size: **{recommendations['best_throughput']['batch_size']}**\n")
             f.write(f"- Steps Per Epoch: **{recommendations['best_throughput']['steps_per_epoch']}**\n")
+            f.write(f"- Num Threads: **{recommendations['best_throughput']['num_threads']}**\n")
             f.write(f"- Steps Per Second: {recommendations['best_throughput']['throughput']:.2f}\n")
             if recommendations['best_throughput']['gpu_utilization'] is not None:
                 f.write(f"- GPU Utilization: {recommendations['best_throughput']['gpu_utilization']:.1f}%\n")
@@ -647,8 +651,10 @@ def main():
                 f.write("### Best GPU Utilization Configuration\n\n")
                 f.write(f"- Batch Size: **{recommendations['best_gpu_utilization']['batch_size']}**\n")
                 f.write(f"- Steps Per Epoch: **{recommendations['best_gpu_utilization']['steps_per_epoch']}**\n")
+                f.write(f"- Num Threads: **{recommendations['best_gpu_utilization']['num_threads']}**\n")
                 f.write(f"- Steps Per Second: {recommendations['best_gpu_utilization']['throughput']:.2f}\n")
-                f.write(f"- GPU Utilization: {recommendations['best_gpu_utilization']['gpu_utilization']:.1f}%\n")
+                if recommendations['best_gpu_utilization']['gpu_utilization'] is not None:
+                    f.write(f"- GPU Utilization: {recommendations['best_gpu_utilization']['gpu_utilization']:.1f}%\n")
                 if recommendations['best_gpu_utilization']['gpu_memory_percent'] is not None:
                     f.write(f"- GPU Memory Usage: {recommendations['best_gpu_utilization']['gpu_memory_percent']:.1f}%\n")
                 f.write("\n")
@@ -657,8 +663,10 @@ def main():
                 f.write("### Best Balanced Configuration\n\n")
                 f.write(f"- Batch Size: **{recommendations['best_composite_score']['batch_size']}**\n")
                 f.write(f"- Steps Per Epoch: **{recommendations['best_composite_score']['steps_per_epoch']}**\n")
+                f.write(f"- Num Threads: **{recommendations['best_composite_score']['num_threads']}**\n")
                 f.write(f"- Steps Per Second: {recommendations['best_composite_score']['throughput']:.2f}\n")
-                f.write(f"- GPU Utilization: {recommendations['best_composite_score']['gpu_utilization']:.1f}%\n")
+                if recommendations['best_composite_score']['gpu_utilization'] is not None:
+                    f.write(f"- GPU Utilization: {recommendations['best_composite_score']['gpu_utilization']:.1f}%\n")
                 if recommendations['best_composite_score']['gpu_memory_percent'] is not None:
                     f.write(f"- GPU Memory Usage: {recommendations['best_composite_score']['gpu_memory_percent']:.1f}%\n")
                 f.write(f"- Composite Score: {recommendations['best_composite_score']['composite_score']:.2f}\n\n")
@@ -673,7 +681,10 @@ def main():
                 rec = recommendations['best_throughput']
                 
             f.write("```bash\n")
-            f.write(f"python src/train.py --use-gpu --batch-size {rec['batch_size']} --steps-per-epoch {rec['steps_per_epoch']} --image-size {args.image_size}\n")
+            base_command = f"python src/train.py --use-gpu --batch-size {rec['batch_size']} --steps-per-epoch {rec['steps_per_epoch']} --image-size {args.image_size}"
+            if args.test_threads:  # If threads were tested, include num_threads in the command
+                base_command += f" --num-threads {rec['num_threads']}"
+            f.write(base_command + "\n")
             f.write("```\n\n")
             
             # Runtime comparison
@@ -743,14 +754,17 @@ def main():
         print("\nBest throughput configuration:")
         print(f"  Batch size: {recommendations['best_throughput']['batch_size']}")
         print(f"  Steps per epoch: {recommendations['best_throughput']['steps_per_epoch']}")
+        print(f"  Num Threads: {recommendations['best_throughput']['num_threads']}")
         print(f"  Steps per second: {recommendations['best_throughput']['throughput']:.2f}")
         
         if 'best_composite_score' in recommendations:
             print("\nBest balanced configuration (recommended):")
             print(f"  Batch size: {recommendations['best_composite_score']['batch_size']}")
             print(f"  Steps per epoch: {recommendations['best_composite_score']['steps_per_epoch']}")
+            print(f"  Num Threads: {recommendations['best_composite_score']['num_threads']}")
             print(f"  Steps per second: {recommendations['best_composite_score']['throughput']:.2f}")
-            print(f"  GPU utilization: {recommendations['best_composite_score']['gpu_utilization']:.1f}%")
+            if recommendations['best_composite_score']['gpu_utilization'] is not None:
+                 print(f"  GPU utilization: {recommendations['best_composite_score']['gpu_utilization']:.1f}%")
         
         print("\nTo use the recommended configuration, run:")
         if 'best_composite_score' in recommendations:
@@ -758,7 +772,10 @@ def main():
         else:
             rec = recommendations['best_throughput']
             
-        print(f"  python src/train.py --use-gpu --batch-size {rec['batch_size']} --steps-per-epoch {rec['steps_per_epoch']} --image-size {args.image_size}")
+        base_command_console = f"  python src/train.py --use-gpu --batch-size {rec['batch_size']} --steps-per-epoch {rec['steps_per_epoch']} --image-size {args.image_size}"
+        if args.test_threads: # If threads were tested, include num_threads in the command
+            base_command_console += f" --num-threads {rec['num_threads']}"
+        print(base_command_console)
     
     print(f"\nDetailed results saved to: {output_dir}")
     print("="*60)
