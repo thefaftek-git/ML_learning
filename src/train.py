@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 
 from utils import load_image, preprocess_reference_image, save_as_svg
 from model import ImageGenerator
+from skimage.metrics import structural_similarity as ssim
 
 # Global variable to track model checkpoints and their loss values
 # Format: List of tuples (loss, epoch, path)
@@ -66,7 +67,11 @@ def parse_args():
     parser.add_argument('--latent-dim', type=int, default=100,
                       help='Dimension of the latent space')
     parser.add_argument('--epochs', type=int, default=500,
-                      help='Number of training epochs')
+                      help='Maximum number of training epochs')
+    parser.add_argument('--target-accuracy', type=float, default=99.99,
+                      help='Target accuracy threshold (as a percentage, e.g. 99.99) to stop training early. Calculated as 100 * (1 - loss)')
+    parser.add_argument('--target-loss', type=float, default=None,
+                      help='Target loss value to stop training early (alternative to target-accuracy)')
     parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for training')
     parser.add_argument('--save-interval', type=int, default=100,
@@ -96,6 +101,13 @@ def parse_args():
     # New GPU optimization option
     parser.add_argument('--steps-per-epoch', type=int, default=10,
                       help='Number of training steps per epoch (default: 10, higher values increase GPU utilization)')
+    # Resume training option
+    parser.add_argument('--resume-guid', type=str, default=None,
+                      help='GUID of a previous training run to resume from')
+    parser.add_argument('--resume-checkpoint', type=str, default='generator_best.pt',
+                      help='Name of the checkpoint file to load when resuming training (defaults to generator_best.pt)')
+    parser.add_argument('--full-color', action='store_true',
+                      help='Use a color (RGB) model instead of grayscale')
     
     return parser.parse_args()
 
@@ -360,6 +372,7 @@ def load_reference_images(args, preview_dir):
     images = []
     image_info = []
     all_annotations = []
+    grayscale = not args.full_color
     
     # Determine if we're loading from a directory or a single file
     if args.reference_dir:
@@ -386,7 +399,7 @@ def load_reference_images(args, preview_dir):
         # Get dimensions from the first image to use as reference
         first_image_path = image_files[0]
         _, original_dimensions, _ = preprocess_reference_image(
-            first_image_path, preview_dir, size=None, show_preview=False
+            first_image_path, preview_dir, size=None, show_preview=False, grayscale=grayscale
         )
         original_height, original_width = original_dimensions
         
@@ -414,7 +427,7 @@ def load_reference_images(args, preview_dir):
             
             # Process the image using the target dimensions
             processed_img, _, annotations = preprocess_reference_image(
-                img_path, preview_dir, size=target_dimensions, show_preview=False
+                img_path, preview_dir, size=target_dimensions, show_preview=False, grayscale=grayscale
             )
             
             # Store annotations if found
@@ -454,14 +467,14 @@ def load_reference_images(args, preview_dir):
         if args.image_size is None and args.width is None and args.height is None:
             # Use original dimensions from the reference image
             processed_img, original_dimensions, annotations = preprocess_reference_image(
-                reference_path, preview_dir, size=None
+                reference_path, preview_dir, size=None, grayscale=grayscale
             )
             height, width = original_dimensions
             print(f"Using reference image's original dimensions: {height}x{width}")
         else:
             # Calculate target dimensions based on arguments
             _, original_dimensions, _ = preprocess_reference_image(
-                reference_path, preview_dir, size=None, show_preview=False
+                reference_path, preview_dir, size=None, show_preview=False, load_full=False, grayscale=grayscale
             )
             original_height, original_width = original_dimensions
             
@@ -471,9 +484,10 @@ def load_reference_images(args, preview_dir):
             )
             height, width = target_dimensions
             
+            print(f"Processing reference image to dimensions: {height}x{width}")
             # Process the image using the target dimensions
             processed_img, _, annotations = preprocess_reference_image(
-                reference_path, preview_dir, size=target_dimensions
+                reference_path, preview_dir, size=target_dimensions, grayscale=grayscale
             )
         
         # Store annotations if found
@@ -663,7 +677,10 @@ def create_reference_grid(images, image_info, output_dir):
     
     for i, (img, info) in enumerate(zip(images, image_info)):
         ax = plt.subplot(gs[i // cols, i % cols])
-        ax.imshow(img[:, :, 0], cmap='gray')
+        if img.shape[2] == 1:
+            ax.imshow(img[:, :, 0], cmap='gray')
+        else:
+            ax.imshow(img)
         ax.set_title(f"{info['filename']}")
         ax.axis('off')
     
@@ -707,42 +724,75 @@ def visualize_progress(generator, epoch, latent_vector, target_image, output_dir
     
     try:
         # Generate image with the current model
-        generated_image = generator.generate_image(latent_vector)
+        with torch.amp.autocast('cuda', enabled=generator.mixed_precision):
+            generated_image = generator.generate_image(latent_vector)
+              # Apply histogram matching to match brightness/contrast of reference image
+        from normalize_image import match_image_brightness_contrast
+        matched_generated_image = match_image_brightness_contrast(generated_image, target_image)
         
         # Create a figure with the target and generated images side by side
-        fig = plt.figure(figsize=(10, 5))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
         
-        # Plot target image
-        plt.subplot(1, 2, 1)
-        plt.imshow(target_image[:, :, 0], cmap='gray')
-        plt.title("Target Image")
-        plt.axis('off')
+        # Plot target image - ensure proper rendering for grayscale or color images
+        if target_image.shape[2] == 1:  # Grayscale image
+            ax1.imshow(target_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
+        else:  # RGB image
+            ax1.imshow(target_image)
+        ax1.set_title("Target Image")
+        ax1.axis('off')
         
-        # Plot generated image
-        plt.subplot(1, 2, 2)
-        plt.imshow(generated_image[:, :, 0], cmap='gray')
-        plt.title(f"Generated (Epoch {epoch})")
-        plt.axis('off')
+        # Plot generated image - ensure proper rendering for grayscale or color images
+        if matched_generated_image.shape[2] == 1:  # Grayscale image
+            ax2.imshow(matched_generated_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
+        else:  # RGB image
+            ax2.imshow(matched_generated_image)
+        ax2.set_title(f"Generated (Epoch {epoch})")
+        ax2.axis('off')
         
         # Save the visualization
         plt.tight_layout()
         viz_path = os.path.join(output_dir, f"{prefix}_{epoch:04d}.png")
-        plt.savefig(viz_path)
+        plt.savefig(viz_path, dpi=150)
         
         # If this is a final comparison, also save it to the main data folder
         if save_comparison:
             comparison_path = os.path.join(os.path.dirname(output_dir), "final_comparison.png")
-            plt.savefig(comparison_path)
+            plt.savefig(comparison_path, dpi=150)
             print(f"Final comparison saved to {comparison_path}")
         
         # Explicitly close the figure to free memory and avoid tkinter issues
         plt.close(fig)
-        
-        # Also save the generated image as SVG
+    
+        # Save the generated image as SVG
         svg_path = os.path.join(output_dir, f"{prefix}_{epoch:04d}.svg")
-        save_as_svg(generated_image, svg_path)
+        save_as_svg(matched_generated_image, svg_path)
         
-        return generated_image
+        # Also save individual images of reference and generated for easier comparison
+        ref_path = os.path.join(output_dir, f"reference.png")
+        if not os.path.exists(ref_path):  # Only save reference once
+            plt.figure(figsize=(5, 5))
+            if target_image.shape[2] == 1:
+                plt.imshow(target_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
+            else:
+                plt.imshow(target_image)
+            plt.axis('off')
+            plt.tight_layout()
+            plt.savefig(ref_path, dpi=150)
+            plt.close()
+        
+        gen_path = os.path.join(output_dir, f"generated_{epoch:04d}.png")
+        plt.figure(figsize=(5, 5))
+        if matched_generated_image.shape[2] == 1:
+            plt.imshow(matched_generated_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
+        else:
+            plt.imshow(matched_generated_image)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(gen_path, dpi=150)
+        plt.close()
+        
+        # Return the matched image for further use
+        return matched_generated_image
     
     except Exception as e:
         print(f"Error during visualization: {e}")
@@ -893,13 +943,19 @@ def create_final_comparison_grid(generator, latent_vector, images, image_info, o
     # Create a figure for the grid
     plt.figure(figsize=(cols * 3, rows * 3))
     gs = GridSpec(rows, cols)
-    
-    # Generate an image with the current model using the fixed latent vector
+      # Generate an image with the current model using the fixed latent vector
     generated_image = generator.generate_image(latent_vector)
+    
+    # Apply histogram matching using the first reference image as a guide
+    from normalize_image import match_image_brightness_contrast
+    matched_generated_image = match_image_brightness_contrast(generated_image, images[0])
     
     # Place the generated image in the top-left corner
     ax = plt.subplot(gs[0, 0])
-    ax.imshow(generated_image[:, :, 0], cmap='gray')
+    if matched_generated_image.shape[2] == 1:
+        ax.imshow(matched_generated_image[:, :, 0], cmap='gray')
+    else:
+        ax.imshow(matched_generated_image)
     ax.set_title("Generated Image")
     ax.axis('off')
     
@@ -909,7 +965,10 @@ def create_final_comparison_grid(generator, latent_vector, images, image_info, o
         col = (i % (cols - 1)) + 1  # +1 to skip the first column
         
         ax = plt.subplot(gs[row, col])
-        ax.imshow(img[:, :, 0], cmap='gray')
+        if img.shape[2] == 1:
+            ax.imshow(img[:, :, 0], cmap='gray')
+        else:
+            ax.imshow(img)
         ax.set_title(f"{info['filename']}")
         ax.axis('off')
     
@@ -922,30 +981,26 @@ def create_final_comparison_grid(generator, latent_vector, images, image_info, o
 
 def calculate_image_similarity(image1, image2):
     """
-    Calculate similarity between two images.
-    
-    Args:
-        image1: First image as numpy array
-        image2: Second image as numpy array
-        
-    Returns:
-        Similarity score between 0 and 1 (higher means more similar)
+    Calculate similarity between two images using both MSE-based similarity and SSIM (contrast-aware).
+    Returns a dictionary with both metrics.
     """
     if image1 is None or image2 is None:
-        return 0.0
-        
+        return {"mse_similarity": 0.0, "ssim": 0.0}
     # Ensure images have the same shape
     if image1.shape != image2.shape:
-        return 0.0
-        
-    # Calculate Mean Squared Error (MSE) between the images
+        return {"mse_similarity": 0.0, "ssim": 0.0}
+    # MSE-based similarity
     mse = np.mean((image1 - image2) ** 2)
-    
-    # Convert to similarity (0 to 1, where 1 means identical)
-    # Using exponential decay function to map MSE to similarity
-    similarity = np.exp(-mse * 10)  # Scale factor can be adjusted
-    
-    return similarity
+    mse_similarity = np.exp(-mse * 10)
+    # SSIM (contrast-aware)
+    if image1.shape[-1] == 1:
+        ssim_score = ssim(image1[:, :, 0], image2[:, :, 0], data_range=1.0)
+    else:
+        try:
+            ssim_score = ssim(image1, image2, data_range=1.0, channel_axis=-1)
+        except TypeError:
+            ssim_score = ssim(image1, image2, data_range=1.0, multichannel=True)
+    return {"mse_similarity": float(mse_similarity), "ssim": float(ssim_score)}
 
 def inject_training_entropy(generator, latent_vector, epoch):
     """
@@ -995,26 +1050,161 @@ def main():
     """Main training function."""
     args = parse_args()
     
-    # Generate a unique GUID for this training run
-    run_guid = str(uuid.uuid4())
-    print(f"Starting training run with GUID: {run_guid}")
-    
-    # Create run-specific output directories using the GUID
-    run_output_dir = os.path.join(args.output_dir, run_guid)
-    run_preview_dir = os.path.join(args.preview_dir, run_guid)
-    
-    # Create the base directories if they don't exist
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.preview_dir, exist_ok=True)
-    
-    # Create the run-specific directories
-    os.makedirs(run_output_dir, exist_ok=True)
-    os.makedirs(run_preview_dir, exist_ok=True)
+    # Check if we're resuming training from a previous run
+    if args.resume_guid:
+        print(f"Resuming training from previous run GUID: {args.resume_guid}")
+        run_guid = args.resume_guid
+        run_output_dir = os.path.join(args.output_dir, run_guid)
+        run_preview_dir = os.path.join(args.preview_dir, run_guid)
+        
+        # Check if directories exist
+        if not os.path.exists(run_output_dir):
+            raise ValueError(f"Cannot resume training: run directory {run_output_dir} not found.")
+        
+        # Load run metadata
+        run_metadata_path = os.path.join(run_output_dir, "run_metadata.json")
+        if not os.path.exists(run_metadata_path):
+            raise ValueError(f"Cannot resume training: metadata file {run_metadata_path} not found.")
+            
+        # Load the metadata to get the original image dimensions and other parameters
+        with open(run_metadata_path, 'r') as f:
+            import json
+            original_metadata = json.load(f)
+            
+        # Get the original training parameters
+        original_args = original_metadata.get('arguments', {})
+        
+        # Check if we can find the model's image dimensions
+        # First try to load a model checkpoint to extract dimensions
+        model_path = os.path.join(run_output_dir, args.resume_checkpoint)
+        if not os.path.exists(model_path):
+            # Try to find any model checkpoint
+            checkpoint_files = [f for f in os.listdir(run_output_dir) if f.startswith("generator_") and f.endswith(".pt")]
+            if checkpoint_files:
+                checkpoint_files.sort(key=lambda f: int(f.split('_')[1].split('.')[0]) if f[10:-3].isdigit() else 0, reverse=True)
+                model_path = os.path.join(run_output_dir, checkpoint_files[0])
+                print(f"Using the latest checkpoint found: {checkpoint_files[0]}")
+            else:
+                raise ValueError(f"Cannot resume training: no checkpoints found in {run_output_dir}")
+        
+        # Load the checkpoint to extract model parameters
+        print(f"Loading model from {model_path} to extract parameters...")
+        checkpoint = torch.load(model_path, map_location='cpu')
+        
+        # Extract image dimensions from the checkpoint if available
+        if 'image_size' in checkpoint:
+            model_height, model_width = checkpoint['image_size']
+            print(f"Found image dimensions in checkpoint: {model_height}x{model_width}")
+            
+            # Override current dimensions with the original ones
+            if args.image_size is not None or args.width is not None or args.height is not None:
+                print("WARNING: Ignoring provided image dimensions and using the original model's dimensions")
+                
+            # Override the command line arguments to match the original dimensions
+            args.image_size = None
+            args.width = model_width
+            args.height = model_height
+            
+            # Also copy the preserve_aspect setting to ensure consistent behavior
+            if 'preserve_aspect' in original_args:
+                args.preserve_aspect = original_args['preserve_aspect']
+                
+            print(f"Will use dimensions from original model: {model_height}x{model_width}")
+        else:
+            print("Warning: Could not find image dimensions in checkpoint")
+            # Try to get dimensions from the original metadata
+            if 'width' in original_args and 'height' in original_args and original_args['width'] and original_args['height']:
+                print(f"Using dimensions from original metadata: {original_args['height']}x{original_args['width']}")
+                args.width = original_args['width']
+                args.height = original_args['height']
+                args.image_size = None
+            elif 'image_size' in original_args and original_args['image_size']:
+                print(f"Using image_size from original metadata: {original_args['image_size']}")
+                args.image_size = original_args['image_size']
+                args.width = None
+                args.height = None
+            else:
+                print("Warning: Could not determine original dimensions. Using provided dimensions.")
+        
+        # Copy other important parameters from the original run
+        if 'latent_dim' in original_args and not args.latent_dim == original_args['latent_dim']:
+            print(f"Using latent dimension from original model: {original_args['latent_dim']}")
+            args.latent_dim = original_args['latent_dim']
+        
+        # Load run stats to resume from
+        run_stats_path = os.path.join(run_output_dir, "run_stats.json")
+        if os.path.exists(run_stats_path):
+            with open(run_stats_path, 'r') as f:
+                import json
+                run_stats = json.load(f)
+            
+            # Get previous losses and epochs
+            losses = run_stats.get("epoch_losses", [])
+            epoch_times = run_stats.get("epoch_times", [])
+            best_loss = run_stats.get("best_loss", float('inf'))
+            best_epoch = run_stats.get("best_epoch", 0)
+            print(f"Loaded previous training stats: {len(losses)} epochs, best loss: {best_loss}")
+        else:
+            # Initialize empty if stats not found
+            print("No previous training stats found. Starting with empty stats.")
+            losses = []
+            epoch_times = []
+            best_loss = float('inf')
+            best_epoch = 0
+            
+            # Initialize run statistics dictionary
+            run_stats = {
+                "epoch_losses": [],
+                "epoch_times": [],
+                "best_loss": None,
+                "best_epoch": None,
+                "total_training_time": None,
+                "steps_per_second": [],
+                "early_stopping_triggered": False,
+                "early_stopping_reason": None
+            }
+        
+        # Ensure preview directory exists (might be missing if preview_dir changed)
+        os.makedirs(run_preview_dir, exist_ok=True)
+    else:
+        # Generate a unique GUID for this training run
+        run_guid = str(uuid.uuid4())
+        print(f"Starting new training run with GUID: {run_guid}")
+        
+        # Create run-specific output directories using the GUID
+        run_output_dir = os.path.join(args.output_dir, run_guid)
+        run_preview_dir = os.path.join(args.preview_dir, run_guid)
+        
+        # Create the base directories if they don't exist
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(args.preview_dir, exist_ok=True)
+        
+        # Create the run-specific directories
+        os.makedirs(run_output_dir, exist_ok=True)
+        os.makedirs(run_preview_dir, exist_ok=True)
+        
+        # Initialize empty stats for new run
+        losses = []
+        epoch_times = []
+        best_loss = float('inf')
+        best_epoch = 0
+        
+        # Initialize the run statistics dictionary
+        run_stats = {
+            "epoch_losses": [],
+            "epoch_times": [],
+            "best_loss": None,
+            "best_epoch": None,
+            "total_training_time": None,
+            "steps_per_second": [],  # Track steps per second for each epoch
+            "early_stopping_triggered": False,
+            "early_stopping_reason": None
+        }
     
     # Collect system information at the beginning of the run
     system_info = collect_system_info()
     
-    # Save run metadata
+    # Save run metadata (or update it if resuming)
     run_metadata = {
         "guid": run_guid,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1098,8 +1288,12 @@ def main():
                 "total_images": num_images,
                 "total_unique_tags": total_tags,
             }, f, indent=2)
+        
+        # Set flag for annotation usage in run_stats
+        run_stats["annotation_usage"] = True
     else:
         print("No annotations found for any images. Training without annotation data.")
+        run_stats["annotation_usage"] = False
     
     if num_images > 1:
         print(f"Training with {num_images} reference images using '{args.image_selection}' selection strategy")
@@ -1133,7 +1327,40 @@ def main():
         generator_args['tag_dim'] = total_tags
         print(f"Configuring model with tag dimension of {total_tags}")
     
-    generator = ImageGenerator(**generator_args)
+    if args.full_color:
+        from model_color import ImageGeneratorColor
+        generator = ImageGeneratorColor(**generator_args)
+        print("Using full color (RGB) model.")
+    else:
+        from model import ImageGenerator
+        generator = ImageGenerator(**generator_args)
+        print("Using grayscale model.")
+    
+    # If resuming, load checkpoint model
+    if args.resume_guid:
+        model_path = os.path.join(run_output_dir, args.resume_checkpoint)
+        if not os.path.exists(model_path):
+            # Try to find the most recent checkpoint (we already did this earlier but use the result)
+            checkpoint_files = [f for f in os.listdir(run_output_dir) if f.startswith("generator_") and f.endswith(".pt")]
+            if checkpoint_files:
+                checkpoint_files.sort(key=lambda f: int(f.split('_')[1].split('.')[0]) if f[10:-3].isdigit() else 0, reverse=True)
+                model_path = os.path.join(run_output_dir, checkpoint_files[0])
+                print(f"Using the latest checkpoint found: {checkpoint_files[0]}")
+            else:
+                raise ValueError(f"Cannot resume training: no checkpoints found in {run_output_dir}")
+                
+        print(f"Loading model from {model_path}")
+        generator.load_model(model_path)
+        print(f"Model loaded successfully")
+        
+        # Define a starting epoch based on the checkpoint or existing stats
+        last_epoch = len(run_stats["epoch_losses"]) if run_stats["epoch_losses"] else 0
+        if "generator_" in os.path.basename(model_path) and os.path.basename(model_path)[10:-3].isdigit():
+            checkpoint_epoch = int(os.path.basename(model_path).split('_')[1].split('.')[0])
+            print(f"Checkpoint is from epoch {checkpoint_epoch}")
+        else:
+            checkpoint_epoch = last_epoch
+            print(f"Using epoch count from stats: {checkpoint_epoch}")
     
     # Apply memory optimizations if requested
     if not args.no_optimize_memory:
@@ -1151,10 +1378,17 @@ def main():
     # Initial visualization
     print("Creating initial visualization...")
     visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
+    
+    # Calculate the right epoch number for visualization
+    viz_epoch = 0
+    if args.resume_guid:
+        # If resuming, use the appropriate epoch number for the visualization
+        viz_epoch = checkpoint_epoch if 'checkpoint_epoch' in locals() else len(run_stats["epoch_losses"])
+    
     if args.no_async_visualization:
-        initial_image = visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
+        initial_image = visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
     else:
-        visualize_func(generator, 0, fixed_latent_vector, vis_target_image, run_preview_dir)
+        visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
         
     # If annotations exist for the visualization target, create an annotated visualization
     if vis_annotations:
@@ -1163,28 +1397,55 @@ def main():
         visualize_annotations(vis_target_image, vis_annotations, output_path=viz_path)
     
     # Training loop
-    print(f"Starting training for {args.epochs} epochs...")
-    losses = []
-    best_loss = float('inf')
-    
-    # Initialize the run statistics dictionary
-    run_stats = {
-        "epoch_losses": [],
-        "epoch_times": [],
-        "best_loss": None,
-        "best_epoch": None,
-        "total_training_time": None,
-        "annotation_usage": has_annotations
-    }
+    print(f"Starting training for up to {args.epochs} epochs...")
+    if args.target_accuracy:
+        print(f"Will stop early if accuracy reaches {args.target_accuracy}%")
+    elif args.target_loss:
+        print(f"Will stop early if loss reaches {args.target_loss}")
     
     # Initialize timing statistics
     start_time = time.time()
-    epoch_times = []
     
-    # Save last generated image for entropy comparison (if requested)
+    # Save last generated image for entropy comparison
     last_generated_image = None
     
-    for epoch in tqdm(range(1, args.epochs + 1)):
+    # Define a custom format for tqdm to show steps/sec instead of sec/it
+    class StepsPerSecondBar(tqdm):
+        """Custom tqdm progress bar that shows steps/sec instead of sec/it"""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.steps_per_epoch = args[0].steps_per_epoch if hasattr(args[0], 'steps_per_epoch') else 0
+            self.last_epoch_time = time.time()
+            self.steps_per_second = 0
+        
+        def format_meter(self, n, total, elapsed, *args, **kwargs):
+            # Calculate steps per second
+            if elapsed > 0:
+                # Get elapsed time since last update
+                current_time = time.time()
+                if hasattr(self, 'last_print_n') and n > self.last_print_n:
+                    epoch_time = current_time - self.last_epoch_time
+                    self.steps_per_second = self.steps_per_epoch / max(epoch_time, 0.001)
+                    self.last_epoch_time = current_time
+                self.last_print_n = n
+                
+                # Format with steps/sec instead of sec/it
+                if self.steps_per_second > 0:
+                    kwargs['rate_fmt'] = '{:.2f} steps/sec'.format(self.steps_per_second)
+            return super().format_meter(n, total, elapsed, *args, **kwargs)
+    
+    # Create progress bar with steps/sec display - start from the right epoch if resuming
+    start_epoch = 1
+    if args.resume_guid:
+        start_epoch = len(run_stats["epoch_losses"]) + 1
+    
+    epochs_to_run = range(start_epoch, args.epochs + 1)
+    progress_bar = StepsPerSecondBar(epochs_to_run, 
+                                    dynamic_ncols=True,
+                                    unit='epoch')
+    progress_bar.steps_per_epoch = args.steps_per_epoch
+    
+    for epoch in progress_bar:
         epoch_start = time.time()
         
         epoch_loss = 0.0
@@ -1264,9 +1525,25 @@ def main():
         if epoch % 10 == 0:
             avg_time = sum(epoch_times[-10:]) / min(10, len(epoch_times[-10:]))
             remaining = (args.epochs - epoch) * avg_time
+            steps_per_second = args.steps_per_epoch / epoch_duration
             print(f"Epoch {epoch}/{args.epochs}, Loss: {avg_epoch_loss:.6f}, " 
                   f"Steps: {args.steps_per_epoch}, Batch: {args.batch_size}, "
+                  f"Steps/sec: {steps_per_second:.2f}, "
                   f"Time: {epoch_duration:.3f}s, Remaining: {remaining/60:.1f}m")
+        
+        # Early stopping based on target accuracy or loss
+        if args.target_accuracy is not None:
+            current_accuracy = 100 * (1 - avg_epoch_loss)
+            if current_accuracy >= args.target_accuracy:
+                print(f"Target accuracy of {args.target_accuracy}% reached at epoch {epoch}. Stopping early.")
+                run_stats["early_stopping_triggered"] = True
+                run_stats["early_stopping_reason"] = f"Target accuracy of {args.target_accuracy}% reached."
+                break
+        if args.target_loss is not None and avg_epoch_loss <= args.target_loss:
+            print(f"Target loss of {args.target_loss} reached at epoch {epoch}. Stopping early.")
+            run_stats["early_stopping_triggered"] = True
+            run_stats["early_stopping_reason"] = f"Target loss of {args.target_loss} reached."
+            break
         
         # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
@@ -1303,14 +1580,16 @@ def main():
                 # Add to run stats
                 if "image_similarities" not in run_stats:
                     run_stats["image_similarities"] = []
-                run_stats["image_similarities"].append(float(similarity))
+                run_stats["image_similarities"].append(similarity)
+                # Optionally, print SSIM for user feedback
+                print(f"Image similarity (MSE-based): {similarity['mse_similarity']:.4f}, SSIM: {similarity['ssim']:.4f}")
                 
                 # Check if images are too similar (training might be stalled)
                 # Or if it's a blank white image (common failure case)
                 is_blank = np.mean(generated_image) > 0.95  # Mostly white
                 
-                if similarity > 0.98 or (is_blank and epoch > vis_interval*2):  # Threshold for detecting stalled training
-                    print(f"WARNING: Generated images have similarity of {similarity:.4f}, training may be stalled.")
+                if similarity["mse_similarity"] > 0.98 or (is_blank and epoch > vis_interval*2):  # Threshold for detecting stalled training
+                    print(f"WARNING: Generated images have similarity of {similarity['mse_similarity']:.4f}, training may be stalled.")
                     
                     # Log the stalled event
                     if "entropy_injections" not in run_stats:
@@ -1318,7 +1597,7 @@ def main():
                     
                     run_stats["entropy_injections"].append({
                         "epoch": epoch,
-                        "similarity": float(similarity),
+                        "similarity": similarity,
                         "is_blank": bool(is_blank)
                     })
                     
@@ -1338,21 +1617,30 @@ def main():
         # Save the best model based on loss
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
+            best_epoch = epoch
             best_model_path = os.path.join(run_output_dir, "generator_best.pt")
             generator.save_model(best_model_path)
             
             # Update run statistics for best model
             run_stats["best_loss"] = float(best_loss)
             run_stats["best_epoch"] = epoch
-    
+
+    # Define best_model_path here to ensure it's always available, even with early stopping
+    best_model_path = os.path.join(run_output_dir, "generator_best.pt")
+        
     # Training complete, show timing information
     total_time = time.time() - start_time
-    avg_epoch_time = total_time / args.epochs
+    avg_epoch_time = total_time / (epoch - start_epoch + 1)  # Use actual epochs run
     print(f"Training completed in {total_time/60:.2f} minutes")
     print(f"Average time per epoch: {avg_epoch_time:.3f} seconds")
     
     # Update final run statistics
-    run_stats["total_training_time"] = float(total_time)
+    if "total_training_time" in run_stats and run_stats["total_training_time"] is not None:
+        # Add to existing training time if resuming
+        run_stats["total_training_time"] += float(total_time)
+    else:
+        run_stats["total_training_time"] = float(total_time)
+        
     run_stats["avg_epoch_time"] = float(avg_epoch_time)
     
     # Save final run statistics

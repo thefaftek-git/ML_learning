@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import pytorch_ssim
 
 class Generator(nn.Module):
     """
@@ -20,28 +21,33 @@ class Generator(nn.Module):
     images from a latent vector input and conditional embedding.
     """
     
-    def __init__(self, latent_dim=100, channels=1, output_size=256, num_conditions=3, tag_dim=0):
+    def __init__(self, image_size, latent_dim=100, device=None, mixed_precision=False, channels=1, num_conditions=3, tag_dim=0, **kwargs):
         """
         Initialize the generator architecture.
         
         Args:
+            image_size: Tuple (height, width) of the output image
             latent_dim: Dimension of the latent space input vector
+            device: PyTorch device to run the model on
+            mixed_precision: Boolean indicating if mixed precision is used
             channels: Number of channels in the output image (1 for grayscale)
-            output_size: Size of the output image (width/height)
             num_conditions: Number of different conditional outputs the model can generate
             tag_dim: Dimension for tag embeddings if using annotations
         """
         super(Generator, self).__init__()
         
-        # Store target output size
-        self.target_height = output_size[0] if isinstance(output_size, tuple) else output_size
-        self.target_width = output_size[1] if isinstance(output_size, tuple) else output_size
+        self.device = device
+        self.mixed_precision = mixed_precision  # Stored, though not explicitly used in this snippet for Generator's own layers
+
+        # Store target output size using image_size
+        self.target_height = image_size[0] if isinstance(image_size, tuple) else image_size
+        self.target_width = image_size[1] if isinstance(image_size, tuple) else image_size
         self.num_conditions = num_conditions
         self.has_tag_support = tag_dim > 0
         self.tag_dim = tag_dim
         
         # Determine the number of upsampling blocks needed
-        self.base_size = 8  # Starting size for feature maps
+        self.base_size = 4  # Starting size for feature maps (reduced from 8 to create more layers)
         self.num_upsample = 0
         
         # Calculate how many upsampling operations we need to get close to target size
@@ -60,27 +66,28 @@ class Generator(nn.Module):
         
         # Embedding layer for condition input
         # Creates a learnable embedding for each condition (image type)
-        self.condition_embedding = nn.Embedding(num_conditions, 32)
+        self.condition_embedding = nn.Embedding(num_conditions, 64)  # Increased from 32
         
         # Embedding layer for tags if tag support is enabled
         if self.has_tag_support:
             print(f"Enabling tag support with dimension {tag_dim}")
-            self.tag_embedding_size = 16
+            self.tag_embedding_size = 32  # Increased from 16
             self.tag_projection = nn.Linear(tag_dim, self.tag_embedding_size)
             
             # Initial dense layer to expand from latent space + condition + tags
-            self.fc = nn.Linear(latent_dim + 32 + self.tag_embedding_size, self.base_size * self.base_size * 256)
+            self.fc = nn.Linear(latent_dim + 64 + self.tag_embedding_size, self.base_size * self.base_size * 512)  # Increased from 256
         else:
             # Initial dense layer to expand from latent space + condition
-            self.fc = nn.Linear(latent_dim + 32, self.base_size * self.base_size * 256)
+            self.fc = nn.Linear(latent_dim + 64, self.base_size * self.base_size * 512)  # Increased from 256
         
         # Create a sequence of upsampling blocks
         layers = []
-        in_channels = 256
+        in_channels = 512  # Increased from 256
         
         for i in range(self.num_upsample - 1):
-            out_channels = max(16, in_channels // 2)  # Halve the channels but keep minimum 16
+            out_channels = max(32, in_channels // 2)  # Increased minimum from 16 to 32
             layers.append(nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1))
+            layers.append(nn.BatchNorm2d(out_channels))  # Added batch normalization
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             in_channels = out_channels
         
@@ -89,6 +96,9 @@ class Generator(nn.Module):
         layers.append(nn.Tanh())  # Output in range [-1, 1]
         
         self.conv_layers = nn.Sequential(*layers)
+
+        if self.device is not None:
+            self.to(self.device)  # Move model to specified device
     
     def forward(self, z, condition=None, tag_tensor=None):
         """
@@ -112,6 +122,10 @@ class Generator(nn.Module):
         # Convert condition to embedding vector
         condition_vector = self.condition_embedding(condition)
         
+        # Ensure condition vector has the right batch dimension
+        if condition_vector.size(0) != batch_size:
+            condition_vector = condition_vector.expand(batch_size, -1)
+        
         if self.has_tag_support and tag_tensor is not None:
             # Process tag tensor through embedding layer
             tag_embedding = self.tag_projection(tag_tensor)
@@ -124,7 +138,7 @@ class Generator(nn.Module):
         
         # Project and reshape combined input
         x = self.fc(combined_input)
-        x = x.view(x.shape[0], 256, self.base_size, self.base_size)
+        x = x.view(x.shape[0], 512, self.base_size, self.base_size)  # Updated to match increased in_channels
         
         # Apply transposed convolutions
         x = self.conv_layers(x)
@@ -139,6 +153,128 @@ class Generator(nn.Module):
             )
         
         return x
+
+    def train_step(self, target_image, condition_id, latent_vector):
+        """
+        Performs a single training step on the generator.
+
+        Args:
+            target_image: Numpy array representing the target grayscale image.
+                          Expected shapes: (H, W), (H, W, 1). It's processed to (B, 1, H, W).
+            condition_id: Integer condition ID for the generator.
+            latent_vector: Numpy array for the latent vector, shape (B, latent_dim).
+
+        Returns:
+            Loss value for the step.
+        """
+        self.train() # Ensure model is in training mode
+
+        current_batch_size = latent_vector.shape[0]
+
+        # 1. Process target_image (Numpy to Torch Tensor)
+        if isinstance(target_image, torch.Tensor):
+            img_np = target_image.detach().cpu().numpy()
+        else:
+            img_np = np.array(target_image, dtype=np.float32)
+
+        if img_np.ndim == 2:  # (H, W)
+            img_np = img_np[:, :, np.newaxis]  # Add channel dim: (H, W, 1)
+        
+        if img_np.ndim == 3: # Single image (H, W, 1) needs to be batched
+            if img_np.shape[2] != 1:
+                raise ValueError(f"Expected target_image to be grayscale (1 channel), got {img_np.shape[2]} channels.")
+            img_np = np.repeat(img_np[np.newaxis, ...], current_batch_size, axis=0) # (B, H, W, 1)
+        elif img_np.ndim == 4: # Already batched (B, H, W, 1)
+            if img_np.shape[0] != current_batch_size:
+                if img_np.shape[0] == 1: # Single image in batch format, repeat for actual batch size
+                    img_np = np.repeat(img_np, current_batch_size, axis=0)
+                else:
+                    raise ValueError(f"Batch size mismatch: target_image batch {img_np.shape[0]}, latent_vector batch {current_batch_size}")
+            if img_np.shape[3] != 1:
+                raise ValueError(f"Expected batched target_image to be grayscale (1 channel), got {img_np.shape[3]} channels.")
+        else:
+            raise ValueError(f"Unsupported target_image ndim: {img_np.ndim}. Expected 2, 3, or 4.")
+
+        if img_np.max() > 1.01: # Normalize if pixels are in [0, 255] range
+            img_np = img_np / 255.0
+        img_np = np.clip(img_np, 0, 1) # Ensure range [0, 1]
+
+        target = torch.tensor(img_np, dtype=torch.float32, device=self.device) # (B, H, W, 1)
+        target = target.permute(0, 3, 1, 2)  # Permute to (B, 1, H, W)
+        target = target * 2.0 - 1.0  # Remap to [-1, 1] for Tanh output
+
+        # 2. Process latent_vector (Numpy to Torch Tensor)
+        z = torch.tensor(latent_vector, dtype=torch.float32, device=self.device)
+
+        # 3. Process condition_id (Scalar to Torch Tensor for batch)
+        condition_input = torch.tensor([condition_id] * current_batch_size, dtype=torch.long, device=self.device)
+
+        # 4. Optimizer (Ad-hoc for benchmark step)
+        optimizer = optim.Adam(self.parameters(), lr=0.001) # Consider making lr configurable
+
+        # 5. Forward pass
+        optimizer.zero_grad()
+        generated_output = self.forward(z, condition_input)
+
+        # 6. Calculate loss
+        loss = F.mse_loss(generated_output, target)
+
+        # 7. Backward pass and optimizer step
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+    def generate_image(self, latent_vector, condition_id=0):
+        """
+        Generates an image from a latent vector and a condition ID.
+
+        Args:
+            latent_vector: Numpy array or Tensor, shape (batch, latent_dim) or (latent_dim,)
+            condition_id: Integer, the condition to use for generation. Defaults to 0.
+
+        Returns:
+            Generated image as a 2D Numpy array (H, W) with values in [0, 1] if batch_size is 1,
+            otherwise a 3D Numpy array (B, H, W).
+        """
+        self.eval()  # Set the model to evaluation mode
+
+        # 1. Process latent_vector
+        if isinstance(latent_vector, np.ndarray):
+            if latent_vector.ndim == 1:  # If shape is (latent_dim,)
+                latent_vector = latent_vector[np.newaxis, :]  # Add batch dimension
+            z = torch.tensor(latent_vector, dtype=torch.float32, device=self.device)
+        else:  # It's already a tensor
+            z = latent_vector.to(device=self.device, dtype=torch.float32)
+            if z.dim() == 1:
+                z = z.unsqueeze(0)  # Add batch dimension
+        
+        current_batch_size = z.size(0)
+
+        # 2. Process condition_id
+        # The forward method expects a condition tensor for the batch
+        condition_input = torch.tensor([condition_id] * current_batch_size, dtype=torch.long, device=self.device)
+
+        # 3. Forward pass
+        with torch.no_grad():
+            # Assuming tag_tensor is not needed for simple generation, self.forward handles tag_tensor=None
+            img_tensor = self.forward(z, condition_input, tag_tensor=None)
+
+        # 4. Post-process
+        img_np = img_tensor.cpu().numpy()  # Shape (B, C, H, W), C=1 for grayscale
+
+        # Denormalize from Tanh output range [-1, 1] to [0, 1]
+        img_np = (img_np + 1.0) / 2.0
+        img_np = np.clip(img_np, 0, 1) # Ensure values are strictly in [0,1]
+
+        if current_batch_size == 1:
+            # For a single image, return (H, W)
+            # Input img_np is (1, 1, H, W) for grayscale
+            return img_np[0, 0, :, :]
+        else:
+            # For a batch of images, return (B, H, W)
+            # Input img_np is (B, 1, H, W) for grayscale
+            return img_np[:, 0, :, :]
 
 class ImageGenerator:
     """
@@ -188,9 +324,11 @@ class ImageGenerator:
             
         # Initialize generator model directly with the target dimensions and condition support
         self.generator = Generator(
+            image_size=image_size,
             latent_dim=latent_dim, 
-            output_size=image_size,
             num_conditions=num_conditions,
+            device=self.device,
+            mixed_precision=mixed_precision,
             tag_dim=tag_dim
         ).to(self.device)
         
@@ -200,8 +338,7 @@ class ImageGenerator:
             lr=0.0002,
             betas=(0.5, 0.999)
         )
-        
-        # Set up mixed precision training if requested and using CUDA
+          # Set up mixed precision training if requested and using CUDA
         if mixed_precision and self.device.type == 'cuda':
             # Import autocast for mixed precision
             from torch.cuda.amp import autocast, GradScaler
@@ -233,14 +370,23 @@ class ImageGenerator:
             # Convert to PyTorch tensor
             if isinstance(latent_vector, np.ndarray):
                 latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
-            
-            # Convert condition to tensor
-            condition = torch.tensor([condition_id], dtype=torch.long, device=self.device)
+                
+            # Ensure batch dimension is correct (handle both single images and batches)
+            if len(latent_vector.shape) == 2:  # Shape is [batch_size, latent_dim]
+                pass  # Already has correct shape
+            elif len(latent_vector.shape) == 1:  # Shape is [latent_dim]
+                latent_vector = latent_vector.unsqueeze(0)  # Add batch dimension
+              # Convert condition to tensor and match batch size
+            batch_size = latent_vector.size(0)
+            condition = torch.full((batch_size,), condition_id, dtype=torch.long, device=self.device)
             
             # Process tag tensor if provided
-            if tag_tensor is not None and self.has_annotation_support:
+            if tag_tensor is not None and self.has_annotation_support:/:":":":":":":":":":":":":":":":":":":":":":">
                 if isinstance(tag_tensor, np.ndarray):
                     tag_tensor = torch.from_numpy(tag_tensor).float().to(self.device)
+                # Make sure tag_tensor has correct batch dimension
+                if tag_tensor.size(0) != batch_size:
+                    tag_tensor = tag_tensor.expand(batch_size, -1)
             else:
                 tag_tensor = None
                 
@@ -257,3 +403,218 @@ class ImageGenerator:
             image_array = (image_array + 1) / 2.0
             
             return image_array
+            
+    def train_step(self, target_image, condition_id, latent_vector=None):
+        """
+        Perform one training step with the given target image and condition.
+        
+        Args:
+            target_image: Target image to learn from (numpy array or tensor)
+            condition_id: Integer specifying which image type to learn
+            latent_vector: Optional latent vectors for generation (if None, will be generated)
+            
+        Returns:
+            Loss value for this training step
+        """
+        self.generator.train()  # Set to training mode
+        
+        batch_size = latent_vector.shape[0] if latent_vector is not None else 1
+        
+        # Process target image
+        if isinstance(target_image, np.ndarray):
+            # Ensure target image is the right shape and format
+            if target_image.ndim == 3 and target_image.shape[2] == 1:
+                # Already (height, width, 1)
+                pass
+            elif target_image.ndim == 2:
+                # Add channel dimension
+                target_image = target_image[..., np.newaxis]
+                
+            # Convert to PyTorch tensor
+            target_tensor = torch.from_numpy(target_image).float().to(self.device)
+            
+            # Reshape to (batch_size, channels, height, width)
+            target_tensor = target_tensor.permute(2, 0, 1).unsqueeze(0)
+            
+            # Expand to match batch size if needed
+            if batch_size > 1 and target_tensor.size(0) == 1:
+                # Use repeat instead of expand for actual data duplication
+                target_tensor = target_tensor.repeat(batch_size, 1, 1, 1)
+                
+            # Scale from [0, 1] to [-1, 1]
+            target_tensor = (target_tensor * 2) - 1
+        else:
+            # Already a tensor, ensure it's on the right device
+            target_tensor = target_image.to(self.device)
+        
+        # Create or process condition tensor
+        if isinstance(condition_id, int):
+            # Convert single condition ID to tensor
+            condition = torch.full((batch_size,), condition_id, dtype=torch.long, device=self.device)
+        else:
+            # Already a tensor or array
+            if isinstance(condition_id, np.ndarray):
+                condition = torch.from_numpy(condition_id).long().to(self.device)
+            else:
+                condition = condition_id.to(self.device)
+        
+        # Create latent vector if not provided
+        if latent_vector is None:
+            latent_vector = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        
+        # Convert latent vector to tensor if needed
+        if isinstance(latent_vector, np.ndarray):
+            latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
+            
+        # Zero the gradients
+        self.optimizer.zero_grad()
+        
+        # Use mixed precision if enabled
+        if self.mixed_precision:
+            with self.autocast():
+                # Forward pass
+                generated = self.generator(latent_vector, condition)
+                
+                # Calculate loss (hybrid MSE + SSIM, with correct scaling)
+                mse_loss = F.mse_loss(generated, target_tensor)
+                # Rescale to [0, 1] for SSIM
+                generated_01 = (generated + 1) / 2
+                target_tensor_01 = (target_tensor + 1) / 2
+                ssim_loss = 1 - pytorch_ssim.ssim(generated_01, target_tensor_01)
+                # Use only SSIM loss for training
+                loss = ssim_loss
+                
+            # Backward pass with scaling
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Forward pass
+            generated = self.generator(latent_vector, condition)
+            
+            # Calculate loss (hybrid MSE + SSIM, with correct scaling)
+            mse_loss = F.mse_loss(generated, target_tensor)
+            generated_01 = (generated + 1) / 2
+            target_tensor_01 = (target_tensor + 1) / 2
+            ssim_loss = 1 - pytorch_ssim.ssim(generated_01, target_tensor_01)
+            # Use only SSIM loss for training
+            loss = ssim_loss
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+        
+        return loss.item()
+        
+    def train_with_annotations(self, target_image, condition_id, latent_vector=None, 
+                             tag_tensor=None, region_masks=None, region_tag_tensor=None):
+        """
+        Train the model with additional annotation information.
+        
+        Args:
+            target_image: Target image to learn from (numpy array)
+            condition_id: Integer specifying which image type to learn
+            latent_vector: Optional latent vectors for generation
+            tag_tensor: Optional tensor with tag information (numpy array)
+            region_masks: Optional tensor with region masks (numpy array)
+            region_tag_tensor: Optional tensor with region-specific tag information
+        
+        Returns:
+            Loss value for this training step
+        """
+        self.generator.train()  # Set to training mode
+        
+        batch_size = latent_vector.shape[0] if latent_vector is not None else 1
+        
+        # Process target image
+        if isinstance(target_image, np.ndarray):
+            # Ensure target image is the right shape and format
+            if target_image.ndim == 3 and target_image.shape[2] == 1:
+                # Already (height, width, 1)
+                pass
+            elif target_image.ndim == 2:
+                # Add channel dimension
+                target_image = target_image[..., np.newaxis]
+                
+            # Convert to PyTorch tensor
+            target_tensor = torch.from_numpy(target_image).float().to(self.device)
+            
+            # Reshape to (batch_size, channels, height, width)
+            target_tensor = target_tensor.permute(2, 0, 1).unsqueeze(0)
+            
+            # Expand to match batch size if needed
+            if batch_size > 1 and target_tensor.size(0) == 1:
+                # Use repeat instead of expand for actual data duplication
+                target_tensor = target_tensor.repeat(batch_size, 1, 1, 1)
+                
+            # Scale from [0, 1] to [-1, 1]
+            target_tensor = (target_tensor * 2) - 1
+        else:
+            # Already a tensor, ensure it's on the right device
+            target_tensor = target_image.to(self.device)
+        
+        # Create or process condition tensor
+        if isinstance(condition_id, int):
+            # Convert single condition ID to tensor
+            condition = torch.full((batch_size,), condition_id, dtype=torch.long, device=self.device)
+        else:
+            # Already a tensor or array
+            if isinstance(condition_id, np.ndarray):
+                condition = torch.from_numpy(condition_id).long().to(self.device)
+            else:
+                condition = condition_id.to(self.device)
+        
+        # Create latent vector if not provided
+        if latent_vector is None:
+            latent_vector = np.random.normal(0, 1, (batch_size, self.latent_dim))
+        
+        # Convert latent vector to tensor if needed
+        if isinstance(latent_vector, np.ndarray):
+            latent_vector = torch.from_numpy(latent_vector).float().to(self.device)
+        
+        # Process tag tensor if provided
+        if tag_tensor is not None and self.has_annotation_support:
+            if isinstance(tag_tensor, np.ndarray):
+                tag_tensor = torch.from_numpy(tag_tensor).float().to(self.device)
+        else:
+            tag_tensor = None
+        
+        # Zero the gradients
+        self.optimizer.zero_grad()
+        
+        # Use mixed precision if enabled
+        if self.mixed_precision:
+            with self.autocast():
+                # Forward pass
+                generated = self.generator(latent_vector, condition, tag_tensor)
+                
+                # Calculate loss (hybrid MSE + SSIM, with correct scaling)
+                mse_loss = F.mse_loss(generated, target_tensor)
+                # Rescale to [0, 1] for SSIM
+                generated_01 = (generated + 1) / 2
+                target_tensor_01 = (target_tensor + 1) / 2
+                ssim_loss = 1 - pytorch_ssim.ssim(generated_01, target_tensor_01)
+                # Use only SSIM loss for annotation training (mixed-precision branch)
+                loss = ssim_loss
+                
+            # Backward pass with scaling
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Forward pass
+            generated = self.generator(latent_vector, condition, tag_tensor)
+            
+            # Calculate loss (hybrid MSE + SSIM, with correct scaling)
+            mse_loss = F.mse_loss(generated, target_tensor)
+            generated_01 = (generated + 1) / 2
+            target_tensor_01 = (target_tensor + 1) / 2
+            ssim_loss = 1 - pytorch_ssim.ssim(generated_01, target_tensor_01)
+            # Use only SSIM loss for annotation training (non-mixed-precision branch)
+            loss = ssim_loss
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+        
+        return loss.item()

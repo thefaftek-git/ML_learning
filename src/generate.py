@@ -4,6 +4,7 @@ Image Generation Script
 This script uses a trained image generator model to create new SVG wireframe images.
 It can generate images from random latent vectors or interpolate between different points.
 It also supports conditional image generation for models trained with multiple image types.
+Generated images have their brightness and contrast matched to reference images for consistency.
 """
 
 import os
@@ -13,7 +14,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 from model import ImageGenerator
-from utils import save_as_svg, create_placeholder_svg
+from utils import save_as_svg, create_placeholder_svg, load_image
+from normalize_image import match_image_brightness_contrast
+from reference_manager import ReferenceManager
 
 def parse_args():
     """Parse command line arguments."""
@@ -133,7 +136,7 @@ def select_condition_interactive(condition_mapping):
         except ValueError:
             print("Please enter a valid number.")
 
-def generate_random_images(generator, count, output_dir, condition_id=0, condition_mapping=None):
+def generate_random_images(generator, count, output_dir, condition_id=0, condition_mapping=None, reference_manager=None):
     """Generate a specified number of random images with the given condition."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -142,6 +145,11 @@ def generate_random_images(generator, count, output_dir, condition_id=0, conditi
     if condition_mapping and condition_id in condition_mapping:
         condition_name = condition_mapping[condition_id]['filename'].split('.')[0]
     
+    # Get reference image for histogram matching
+    reference_image = None
+    if reference_manager:
+        reference_image = reference_manager.get_reference_image(condition_id)
+    
     for i in range(count):
         # Generate random latent vector
         latent_vector = np.random.normal(0, 1, (1, generator.latent_dim))
@@ -149,17 +157,23 @@ def generate_random_images(generator, count, output_dir, condition_id=0, conditi
         # Generate the image with the specified condition
         generated_image = generator.generate_image(latent_vector, condition_id)
         
+        # Apply histogram matching if reference image is available
+        if reference_image is not None:
+            matched_image = match_image_brightness_contrast(generated_image, reference_image)
+        else:
+            matched_image = generated_image
+        
         # Save as PNG
         output_path = os.path.join(output_dir, f"{condition_name}_random_{i+1}.png")
-        plt.imsave(output_path, generated_image[:,:,0], cmap='gray')
+        plt.imsave(output_path, matched_image[:,:,0], cmap='gray')
         
-        # Save as SVG
+        # Save as SVG (use original image for SVG since we only want to match visual appearance)
         svg_path = os.path.join(output_dir, f"{condition_name}_random_{i+1}.svg")
         save_as_svg(generated_image, svg_path)
         
         print(f"Generated image (condition: {condition_id}) saved to {output_path} and {svg_path}")
 
-def generate_interpolated_images(generator, steps, output_dir, condition_id=0, condition_mapping=None):
+def generate_interpolated_images(generator, steps, output_dir, condition_id=0, condition_mapping=None, reference_manager=None):
     """Generate a sequence of images by interpolating between two random points."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -167,6 +181,11 @@ def generate_interpolated_images(generator, steps, output_dir, condition_id=0, c
     condition_name = "default"
     if condition_mapping and condition_id in condition_mapping:
         condition_name = condition_mapping[condition_id]['filename'].split('.')[0]
+    
+    # Get reference image for histogram matching
+    reference_image = None
+    if reference_manager:
+        reference_image = reference_manager.get_reference_image(condition_id)
     
     # Generate two random latent vectors
     start_vector = np.random.normal(0, 1, (1, generator.latent_dim))
@@ -183,17 +202,22 @@ def generate_interpolated_images(generator, steps, output_dir, condition_id=0, c
         # Generate the image with the specified condition
         generated_image = generator.generate_image(latent_vector, condition_id)
         
+        # Apply histogram matching if reference image is available
+        if reference_image is not None:
+            matched_image = match_image_brightness_contrast(generated_image, reference_image)
+        else:
+            matched_image = generated_image
+        
         # Save as PNG
         output_path = os.path.join(output_dir, f"{condition_name}_interpolate_{i+1:02d}.png")
-        plt.imsave(output_path, generated_image[:,:,0], cmap='gray')
+        plt.imsave(output_path, matched_image[:,:,0], cmap='gray')
         
-        # Save as SVG
+        # Save as SVG (use original image for SVG since we only want to match visual appearance)
         svg_path = os.path.join(output_dir, f"{condition_name}_interpolate_{i+1:02d}.svg")
         save_as_svg(generated_image, svg_path)
         
         print(f"Generated interpolation step {i+1}/{steps} (condition: {condition_id}) saved")
-    
-    # Create a grid visualization of the interpolation
+      # Create a grid visualization of the interpolation
     plt.figure(figsize=(12, 4))
     for i, alpha in enumerate(alphas):
         if i >= 10:  # Only show up to 10 images in the grid
@@ -206,7 +230,13 @@ def generate_interpolated_images(generator, steps, output_dir, condition_id=0, c
         # Generate the image with the specified condition
         generated_image = generator.generate_image(latent_vector, condition_id)
         
-        plt.imshow(generated_image[:,:,0], cmap='gray')
+        # Apply histogram matching if reference image is available
+        if reference_image is not None:
+            matched_image = match_image_brightness_contrast(generated_image, reference_image)
+        else:
+            matched_image = generated_image
+        
+        plt.imshow(matched_image[:,:,0], cmap='gray')
         plt.title(f"Step {i+1}")
         plt.axis('off')
     
@@ -216,7 +246,7 @@ def generate_interpolated_images(generator, steps, output_dir, condition_id=0, c
     plt.close()
     print(f"Interpolation grid saved to {grid_path}")
 
-def generate_all_conditions(generator, output_dir, condition_mapping):
+def generate_all_conditions(generator, output_dir, condition_mapping, reference_manager=None):
     """Generate images for all available conditions using the same latent vector."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -237,20 +267,30 @@ def generate_all_conditions(generator, output_dir, condition_mapping):
     for i, (condition_id, info) in enumerate(condition_mapping.items()):
         condition_name = info['filename'].split('.')[0]
         
+        # Get reference image for this condition
+        reference_image = None
+        if reference_manager:
+            reference_image = reference_manager.get_reference_image(condition_id)
+            
         # Generate image with this condition
         generated_image = generator.generate_image(latent_vector, condition_id)
         
-        # Save individual image
+        # Apply histogram matching if reference image is available
+        if reference_image is not None:
+            matched_image = match_image_brightness_contrast(generated_image, reference_image)
+        else:
+            matched_image = generated_image
+          # Save individual image
         output_path = os.path.join(output_dir, f"condition_{condition_id}_{condition_name}.png")
-        plt.imsave(output_path, generated_image[:,:,0], cmap='gray')
+        plt.imsave(output_path, matched_image[:,:,0], cmap='gray')
         
-        # Save as SVG
+        # Save as SVG (use original image for SVG since we only want to match visual appearance)
         svg_path = os.path.join(output_dir, f"condition_{condition_id}_{condition_name}.svg")
         save_as_svg(generated_image, svg_path)
         
         # Add to comparison figure
         plt.subplot(fig_rows, fig_cols, i+1)
-        plt.imshow(generated_image[:,:,0], cmap='gray')
+        plt.imshow(matched_image[:,:,0], cmap='gray')
         plt.title(f"{condition_name} (ID: {condition_id})")
         plt.axis('off')
         
@@ -380,17 +420,19 @@ def main():
     elif args.condition is not None:
         # Use the specified condition
         condition_id = resolve_condition(args.condition, condition_mapping)
+      # Initialize the reference manager for histogram matching
+    reference_manager = ReferenceManager(mapping=condition_mapping)
     
     # Generate images based on the selected mode
     if args.mode == 'random':
         print(f"Generating {args.count} random images with condition ID {condition_id}...")
-        generate_random_images(generator, args.count, output_subdir, condition_id, condition_mapping)
+        generate_random_images(generator, args.count, output_subdir, condition_id, condition_mapping, reference_manager)
     elif args.mode == 'interpolate':
         print(f"Generating {args.steps} interpolated images with condition ID {condition_id}...")
-        generate_interpolated_images(generator, args.steps, output_subdir, condition_id, condition_mapping)
+        generate_interpolated_images(generator, args.steps, output_subdir, condition_id, condition_mapping, reference_manager)
     elif args.mode == 'all-conditions':
         print(f"Generating images for all available conditions...")
-        generate_all_conditions(generator, output_subdir, condition_mapping)
+        generate_all_conditions(generator, output_subdir, condition_mapping, reference_manager)
     
     print(f"Image generation completed successfully. Results saved to {output_subdir}")
 

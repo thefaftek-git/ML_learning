@@ -24,6 +24,342 @@ except (ImportError, OSError):
     print("Warning: CairoSVG not available. SVG import functionality will be limited.")
     # Continue without cairosvg
 
+# Add missing function for saving images as SVG
+def save_as_svg(image, output_path):
+    """
+    Save an image as an SVG file.
+    
+    Args:
+        image: Numpy array with shape (height, width, 1) or (height, width, 3)
+        output_path: Path to save the SVG file
+    """
+    height, width = image.shape[:2]
+    
+    # Create SVG drawing with the same dimensions as the image
+    dwg = svgwrite.Drawing(output_path, size=(width, height))
+    
+    # If image is already normalized to [0, 1], keep as is, otherwise normalize
+    if image.max() > 1.0:
+        normalized_image = image / 255.0
+    else:
+        normalized_image = image.copy()
+    
+    # For each pixel in the image, create a rectangle with the appropriate color
+    for y in range(0, height, 1):
+        for x in range(0, width, 1):
+            if len(image.shape) == 3 and image.shape[2] == 3:
+                # RGB image
+                r, g, b = normalized_image[y, x]
+                color = svgwrite.rgb(r * 100, g * 100, b * 100, '%')
+            else:
+                # Grayscale image
+                gray = normalized_image[y, x, 0] if len(image.shape) == 3 else normalized_image[y, x]
+                color = svgwrite.rgb(gray * 100, gray * 100, gray * 100, '%')
+            
+            dwg.add(dwg.rect(insert=(x, y), size=(1, 1), fill=color))
+    
+    # Save the SVG file
+    dwg.save()
+    
+    return True
+
+def get_image_dimensions(image_path):
+    """
+    Get the dimensions of an image file.
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Tuple of (height, width) dimensions
+    """
+    # Handle based on file extension
+    file_ext = os.path.splitext(image_path)[1].lower()
+    
+    if file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+        # For raster image formats, use PIL
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+                return (height, width)  # Return as (height, width) for numpy consistency
+        except Exception as e:
+            print(f"Error getting image dimensions from {image_path}: {e}")
+            return (256, 256)  # Default fallback size
+            
+    elif file_ext == '.svg':
+        # For SVG images, this is harder without loading the full image
+        if CAIRO_AVAILABLE:
+            try:
+                # Try to parse SVG dimensions using cairosvg
+                with open(image_path, 'rb') as f:
+                    svg_data = f.read()
+                png_data = cairosvg.svg2png(bytestring=svg_data, write_to=None)
+                img = Image.open(io.BytesIO(png_data))
+                width, height = img.size
+                return (height, width)  # Return as (height, width) for numpy consistency
+            except Exception as e:
+                print(f"Error getting SVG dimensions from {image_path}: {e}")
+                return (256, 256)  # Default fallback size
+        else:
+            # Without cairosvg, try a simple method to extract width/height from SVG XML
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(image_path)
+                root = tree.getroot()
+                
+                # Try to get dimensions from the SVG element
+                if 'width' in root.attrib and 'height' in root.attrib:
+                    width = root.attrib['width']
+                    height = root.attrib['height']
+                    
+                    # Convert to pixels if specified with units
+                    width = float(width.replace('px', '')) if 'px' in width else float(width)
+                    height = float(height.replace('px', '')) if 'px' in height else float(height)
+                    
+                    return (int(height), int(width))
+                    
+                # If viewBox is specified, parse it
+                elif 'viewBox' in root.attrib:
+                    # viewBox format is: min-x min-y width height
+                    viewbox = root.attrib['viewBox'].split()
+                    if len(viewbox) >= 4:
+                        width = float(viewbox[2])
+                        height = float(viewbox[3])
+                        return (int(height), int(width))
+            except Exception as e:
+                print(f"Error parsing SVG dimensions from {image_path}: {e}")
+            
+            # If all else fails, return a default size
+            print(f"Warning: Could not determine SVG dimensions for {image_path}. Using default size.")
+            return (256, 256)
+    else:
+        # Unsupported format
+        print(f"Warning: Unsupported image format: {file_ext}. Using default size.")
+        return (256, 256)
+
+def load_raster_image(image_path, size=(128, 128), grayscale=True):
+    """
+    Load a raster image (JPG, PNG, etc.) and convert it to a numpy array.
+    
+    Args:
+        image_path: Path to the image file
+        size: Tuple (height, width) for the desired image size
+        grayscale: Whether to load the image as grayscale (default: True)
+        
+    Returns:
+        Numpy array with shape (height, width, 1) for grayscale or (height, width, 3) for color
+    """
+    try:
+        # Open image with PIL
+        with Image.open(image_path) as img:
+            if grayscale:
+                # Convert to grayscale
+                img = img.convert('L')
+            else:
+                # Convert to RGB
+                img = img.convert('RGB')
+            
+            # Resize if needed
+            if size is not None:
+                # PIL uses (width, height) but our size is (height, width)
+                img = img.resize((size[1], size[0]))
+            
+            # Convert to numpy array and normalize
+            image_array = np.array(img).astype(np.float32) / 255.0
+            
+            # Add channel dimension for grayscale
+            if grayscale:
+                return image_array[:, :, np.newaxis]
+            else:
+                return image_array  # shape (height, width, 3)
+            
+    except Exception as e:
+        print(f"Error loading image from {image_path}: {e}")
+        # Return a blank image as a fallback
+        if size is not None:
+            if grayscale:
+                return np.ones((size[0], size[1], 1), dtype=np.float32) * 0.9
+            else:
+                return np.ones((size[0], size[1], 3), dtype=np.float32) * 0.9
+        else:
+            if grayscale:
+                return np.ones((256, 256, 1), dtype=np.float32) * 0.9
+            else:
+                return np.ones((256, 256, 3), dtype=np.float32) * 0.9
+
+def load_svg_image(image_path, size=(128, 128)):
+    """
+    Load an SVG image and convert it to a numpy array using CairoSVG.
+    
+    Args:
+        image_path: Path to the SVG file
+        size: Tuple (height, width) for the desired image size
+        
+    Returns:
+        Numpy array with shape (height, width, 1) containing the image data
+    """
+    if not CAIRO_AVAILABLE:
+        print("Error: CairoSVG is required to load SVG files this way.")
+        return load_svg_simplified(image_path, size)
+    
+    try:
+        # Convert SVG to PNG bytes using CairoSVG
+        png_data = cairosvg.svg2png(
+            url=image_path, 
+            output_width=size[1], 
+            output_height=size[0]
+        )
+        
+        # Load PNG bytes with PIL
+        img = Image.open(io.BytesIO(png_data))
+        
+        # Convert to grayscale
+        img = img.convert('L')
+        
+        # Convert to numpy array and normalize
+        image_array = np.array(img).astype(np.float32) / 255.0
+        
+        # Add channel dimension
+        return image_array[:, :, np.newaxis]
+        
+    except Exception as e:
+        print(f"Error loading SVG from {image_path}: {e}")
+        # Return a blank image as a fallback
+        return np.ones((size[0], size[1], 1), dtype=np.float32) * 0.9
+
+def load_svg_simplified(image_path, size=(128, 128)):
+    """
+    Load an SVG image using a simplified approach without CairoSVG.
+    This is a fallback method when CairoSVG is not available.
+    
+    Note: This method creates a blank image with basic shapes based on SVG paths,
+    but won't capture all details of complex SVGs.
+    
+    Args:
+        image_path: Path to the SVG file
+        size: Tuple (height, width) for the desired image size
+        
+    Returns:
+        Numpy array with shape (height, width, 1) containing the image data
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        
+        # Create a blank image
+        height, width = size
+        image = np.ones((height, width, 1), dtype=np.float32) * 0.95  # Light gray background
+        
+        # Parse SVG file
+        tree = ET.parse(image_path)
+        root = tree.getroot()
+        
+        # Extract viewBox if available to understand the original coordinate system
+        viewbox = None
+        if 'viewBox' in root.attrib:
+            viewbox = root.attrib['viewBox'].split()
+            if len(viewbox) >= 4:
+                viewbox = [float(x) for x in viewbox]
+        
+        # Extract namespace if present
+        ns = ''
+        if '}' in root.tag:
+            ns = root.tag.split('}')[0] + '}'
+        
+        # Look for path elements
+        paths = root.findall(f'.//{ns}path')
+        for path in paths:
+            if 'd' in path.attrib:
+                # Very basic implementation - just mark the path with darker pixels
+                # This doesn't actually parse the SVG path commands correctly
+                # Just a placeholder to show something happened
+                x_center = width // 2
+                y_center = height // 2
+                radius = min(width, height) // 4
+                
+                # Draw a basic shape (circle) as a placeholder
+                for y in range(height):
+                    for x in range(width):
+                        if ((x - x_center)**2 + (y - y_center)**2) < radius**2:
+                            image[y, x, 0] = 0.2  # Darker color for the shape
+        
+        # Look for rect elements
+        rects = root.findall(f'.//{ns}rect')
+        for rect in rects:
+            # Basic implementation: Just draw a rectangle if coordinates are available
+            if all(k in rect.attrib for k in ['x', 'y', 'width', 'height']):
+                try:
+                    x = float(rect.attrib['x'])
+                    y = float(rect.attrib['y'])
+                    w = float(rect.attrib['width'])
+                    h = float(rect.attrib['height'])
+                    
+                    # Scale to our image size if viewBox is available
+                    if viewbox:
+                        vb_width = viewbox[2]
+                        vb_height = viewbox[3]
+                        x = int(x * width / vb_width)
+                        y = int(y * height / vb_height)
+                        w = int(w * width / vb_width)
+                        h = int(h * height / vb_height)
+                    else:
+                        # No viewBox, make a guess
+                        x = int(x * width / 100)
+                        y = int(y * height / 100)
+                        w = int(w * width / 100)
+                        h = int(h * height / 100)
+                    
+                    # Ensure coordinates are within bounds
+                    x1 = max(0, min(width - 1, int(x)))
+                    y1 = max(0, min(height - 1, int(y)))
+                    x2 = max(0, min(width - 1, int(x + w)))
+                    y2 = max(0, min(height - 1, int(y + h)))
+                    
+                    # Draw the rectangle
+                    image[y1:y2, x1:x2, 0] = 0.2  # Darker color
+                    
+                except Exception as e:
+                    print(f"Error parsing rect element: {e}")
+        
+        # Look for circle elements
+        circles = root.findall(f'.//{ns}circle')
+        for circle in circles:
+            # Basic implementation: Just draw a circle if coordinates are available
+            if all(k in circle.attrib for k in ['cx', 'cy', 'r']):
+                try:
+                    cx = float(circle.attrib['cx'])
+                    cy = float(circle.attrib['cy'])
+                    r = float(circle.attrib['r'])
+                    
+                    # Scale to our image size if viewBox is available
+                    if viewbox:
+                        vb_width = viewbox[2]
+                        vb_height = viewbox[3]
+                        cx = int(cx * width / vb_width)
+                        cy = int(cy * height / vb_height)
+                        r = int(r * width / vb_width)  # Assuming same scale for x and y
+                    else:
+                        # No viewBox, make a guess
+                        cx = int(cx * width / 100)
+                        cy = int(cy * height / 100)
+                        r = int(r * width / 100)
+                    
+                    # Draw the circle
+                    for y in range(height):
+                        for x in range(width):
+                            if ((x - cx)**2 + (y - cy)**2) < r**2:
+                                image[y, x, 0] = 0.2  # Darker color for the shape
+                                
+                except Exception as e:
+                    print(f"Error parsing circle element: {e}")
+        
+        # Return the simplified image
+        return image
+        
+    except Exception as e:
+        print(f"Error with simplified SVG loading from {image_path}: {e}")
+        # Return a blank image as a fallback
+        return np.ones((size[0], size[1], 1), dtype=np.float32) * 0.9
+
 # Annotation handling functions
 def find_annotation_file(image_path):
     """
@@ -395,16 +731,17 @@ def visualize_annotations(image, annotations, output_path=None, show=False):
     
     return viz_image
 
-def load_image(image_path, size=(128, 128)):
+def load_image(image_path, size=(128, 128), grayscale=True):
     """
     Load an image (JPG, PNG, or SVG) and convert it to a numpy array.
     
     Args:
         image_path: Path to the image file
         size: Tuple (height, width) for the desired image size
+        grayscale: Whether to load the image as grayscale (default: True)
         
     Returns:
-        Numpy array with shape (height, width, 1) containing the image data
+        Numpy array with shape (height, width, 1) for grayscale or (height, width, 3) for color
     """
     # Check if the file exists
     if not os.path.exists(image_path):
@@ -415,7 +752,7 @@ def load_image(image_path, size=(128, 128)):
     
     if file_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
         # For raster image formats (JPG, PNG, etc.)
-        return load_raster_image(image_path, size)
+        return load_raster_image(image_path, size, grayscale=grayscale)
     elif file_ext == '.svg':
         # For SVG images
         if CAIRO_AVAILABLE:
@@ -427,7 +764,7 @@ def load_image(image_path, size=(128, 128)):
     else:
         raise ValueError(f"Unsupported file format: {file_ext}")
 
-def preprocess_reference_image(reference_path, output_dir, size=None, show_preview=True, preserve_dimensions=True, load_annotations=True):
+def preprocess_reference_image(reference_path, output_dir, size=None, show_preview=True, preserve_dimensions=True, load_annotations=True, load_full=True, grayscale=True):
     """
     Preprocess the reference image for training.
     
@@ -445,6 +782,8 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
         show_preview: Whether to save a preview visualization
         preserve_dimensions: Whether to preserve the original aspect ratio
         load_annotations: Whether to look for annotation files
+        load_full: Whether to load the full image or just get dimensions
+        grayscale: Whether to load the image as grayscale (default: True)
         
     Returns:
         Tuple of (processed_image, original_dimensions, annotations) where:
@@ -458,6 +797,10 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
     # Detect original image dimensions
     original_dimensions = get_image_dimensions(reference_path)
     print(f"Original reference image dimensions: {original_dimensions[0]}x{original_dimensions[1]}")
+    
+    # If we're just getting dimensions, return early
+    if not load_full:
+        return None, original_dimensions, None
     
     # If size is not provided, use original dimensions
     if size is None:
@@ -474,7 +817,7 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
         if height is None:
             height = original_dimensions[0]
         size = (height, width)  # Note: size is (height, width) for consistency with numpy arrays
-        
+    
     print(f"Processing reference image to dimensions: {size[0]}x{size[1]}")
     
     # Check if it's an SVG file
@@ -485,7 +828,7 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
         processed_image = load_svg_simplified(reference_path, size)
     else:
         # Use standard image loading for other formats
-        processed_image = load_image(reference_path, size)
+        processed_image = load_image(reference_path, size, grayscale=grayscale)
     
     # Look for annotation file if requested
     annotations = None
@@ -505,7 +848,10 @@ def preprocess_reference_image(reference_path, output_dir, size=None, show_previ
             # Save the processed reference image for visualization
             preview_path = os.path.join(output_dir, 'reference_processed.png')
             fig = plt.figure(figsize=(6, 6))
-            plt.imshow(processed_image[:, :, 0], cmap='gray')
+            if processed_image.shape[-1] == 1:
+                plt.imshow(processed_image[:, :, 0], cmap='gray')
+            else:
+                plt.imshow(processed_image)
             plt.title("Processed Reference Image")
             plt.axis('off')
             plt.savefig(preview_path)
