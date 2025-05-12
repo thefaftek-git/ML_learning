@@ -349,6 +349,87 @@ def save_model_architecture_info(generator, output_path):
     except Exception as e:
         print(f"Error saving model architecture information: {e}")
 
+def save_per_image_loss_plot(image_losses, image_info, output_dir):
+    """
+    Save a plot showing training loss for each reference image separately.
+    
+    Args:
+        image_losses: Dictionary mapping condition_id to list of loss values
+        image_info: List of image info dictionaries
+        output_dir: Directory to save the plot
+    """
+    try:
+        # Create a mapping from condition_id to readable name
+        id_to_name = {info['condition_id']: f"{info['filename']} (ID {info['condition_id']})" 
+                     for info in image_info}
+        
+        # Create the plot
+        fig = plt.figure(figsize=(12, 6))
+        
+        # Plot each image's loss curve
+        for condition_id, losses in image_losses.items():
+            if len(losses) > 0:  # Only plot if we have data
+                steps = list(range(1, len(losses) + 1))
+                label = id_to_name.get(condition_id, f"Image ID {condition_id}")
+                plt.plot(steps, losses, label=label, linewidth=2)
+        
+        plt.title('Training Loss Per Reference Image')
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend(loc='upper right')
+        
+        # Add a horizontal line for the best overall loss if available
+        all_min = float('inf')
+        for losses in image_losses.values():
+            if losses and min(losses) < all_min:
+                all_min = min(losses)
+        
+        if all_min < float('inf'):
+            plt.axhline(y=all_min, color='r', linestyle='--', 
+                       label=f'Best Loss: {all_min:.6f}')
+            plt.legend(loc='upper right')
+        
+        # Save the plot
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'per_image_loss_curve.png'))
+        plt.close(fig)
+        
+        # Also save individual plots for each image in their respective directories
+        for condition_id, losses in image_losses.items():
+            if len(losses) > 0:
+                # Create a specific directory for this reference image's data
+                img_specific_dir = os.path.join(output_dir, f"ref_{condition_id}")
+                os.makedirs(img_specific_dir, exist_ok=True)
+                
+                fig = plt.figure(figsize=(8, 5))
+                steps = list(range(1, len(losses) + 1))
+                plt.plot(steps, losses, linewidth=2, color='blue')
+                
+                name = id_to_name.get(condition_id, f"Image ID {condition_id}")
+                plt.title(f'Training Loss For {name}')
+                plt.xlabel('Training Steps')
+                plt.ylabel('Loss')
+                plt.grid(True)
+                
+                # Add min/max/average indicators
+                if losses:
+                    min_loss = min(losses)
+                    min_step = losses.index(min_loss) + 1
+                    plt.axhline(y=min_loss, color='g', linestyle='--', 
+                               label=f'Best: {min_loss:.6f} (Step {min_step})')
+                    plt.axhline(y=sum(losses)/len(losses), color='r', linestyle=':',
+                               label=f'Avg: {sum(losses)/len(losses):.6f}')
+                    plt.legend(loc='upper right')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(img_specific_dir, 'loss_curve.png'))
+                plt.close(fig)
+                
+    except Exception as e:
+        print(f"Error saving per-image loss plot: {e}")
+        plt.close('all')  # Close all figures in case of error
+
 def load_reference_images(args, preview_dir):
     """
     Load reference images based on command-line arguments.
@@ -718,7 +799,7 @@ def select_target_image(images, image_info, all_annotations, epoch, selection_me
         idx = epoch % len(images)
         return images[idx], image_info[idx], all_annotations[idx] if all_annotations else None
 
-def visualize_progress(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False):
+def visualize_progress(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False, image_info=None):
     """Save a visualization of training progress."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -738,7 +819,13 @@ def visualize_progress(generator, epoch, latent_vector, target_image, output_dir
             ax1.imshow(target_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
         else:  # RGB image
             ax1.imshow(target_image)
-        ax1.set_title("Target Image")
+        
+        # Create a more informative title using image_info if available
+        target_title = "Target Image"
+        if image_info:
+            target_title = f"Target: {image_info['filename']} (ID {image_info['condition_id']})"
+            
+        ax1.set_title(target_title)
         ax1.axis('off')
         
         # Plot generated image - ensure proper rendering for grayscale or color images
@@ -753,8 +840,7 @@ def visualize_progress(generator, epoch, latent_vector, target_image, output_dir
         plt.tight_layout()
         viz_path = os.path.join(output_dir, f"{prefix}_{epoch:04d}.png")
         plt.savefig(viz_path, dpi=150)
-        
-        # If this is a final comparison, also save it to the main data folder
+          # If this is a final comparison, also save it to the main data folder
         if save_comparison:
             comparison_path = os.path.join(os.path.dirname(output_dir), "final_comparison.png")
             plt.savefig(comparison_path, dpi=150)
@@ -768,13 +854,23 @@ def visualize_progress(generator, epoch, latent_vector, target_image, output_dir
         save_as_svg(matched_generated_image, svg_path)
         
         # Also save individual images of reference and generated for easier comparison
-        ref_path = os.path.join(output_dir, f"reference.png")
+        # Use a more informative filename if image_info is available
+        ref_filename = "reference.png"
+        if image_info:
+            ref_filename = f"reference_{image_info['filename']}_{image_info['condition_id']}.png"
+            
+        ref_path = os.path.join(output_dir, ref_filename)
         if not os.path.exists(ref_path):  # Only save reference once
             plt.figure(figsize=(5, 5))
             if target_image.shape[2] == 1:
                 plt.imshow(target_image[:, :, 0], cmap='gray', vmin=0, vmax=1)
             else:
                 plt.imshow(target_image)
+                
+            # Add title with image filename if available
+            if image_info:
+                plt.title(f"{image_info['filename']} (ID {image_info['condition_id']})")
+                
             plt.axis('off')
             plt.tight_layout()
             plt.savefig(ref_path, dpi=150)
@@ -800,7 +896,7 @@ def visualize_progress(generator, epoch, latent_vector, target_image, output_dir
         plt.close('all')
         return None
 
-def visualize_progress_async(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False):
+def visualize_progress_async(generator, epoch, latent_vector, target_image, output_dir, prefix="progress", save_comparison=False, image_info=None):
     """
     Create visualizations in a background thread to avoid interrupting training.
     Launches the visualization_worker function in a separate thread.
@@ -814,7 +910,7 @@ def visualize_progress_async(generator, epoch, latent_vector, target_image, outp
     # Create a thread to do the visualization work
     thread = threading.Thread(
         target=visualize_progress,
-        args=(generator, epoch, latent_vector, target_image, output_dir, prefix, save_comparison),
+        args=(generator, epoch, latent_vector, target_image, output_dir, prefix, save_comparison, image_info),
         daemon=True  # Allow the program to exit even if this thread is running
     )
     thread.start()
@@ -949,8 +1045,7 @@ def create_final_comparison_grid(generator, latent_vector, images, image_info, o
     # Apply histogram matching using the first reference image as a guide
     from normalize_image import match_image_brightness_contrast
     matched_generated_image = match_image_brightness_contrast(generated_image, images[0])
-    
-    # Place the generated image in the top-left corner
+      # Place the generated image in the top-left corner
     ax = plt.subplot(gs[0, 0])
     if matched_generated_image.shape[2] == 1:
         ax.imshow(matched_generated_image[:, :, 0], cmap='gray')
@@ -969,7 +1064,7 @@ def create_final_comparison_grid(generator, latent_vector, images, image_info, o
             ax.imshow(img[:, :, 0], cmap='gray')
         else:
             ax.imshow(img)
-        ax.set_title(f"{info['filename']}")
+        ax.set_title(f"Ref #{info['condition_id']}: {info['filename']}")
         ax.axis('off')
     
     plt.tight_layout()
@@ -1200,6 +1295,8 @@ def main():
             "early_stopping_triggered": False,
             "early_stopping_reason": None
         }
+      # We'll initialize per-image loss tracking later after loading the images
+    # This avoids accessing image_info before it's defined
     
     # Collect system information at the beginning of the run
     system_info = collect_system_info()
@@ -1294,11 +1391,17 @@ def main():
     else:
         print("No annotations found for any images. Training without annotation data.")
         run_stats["annotation_usage"] = False
-    
     if num_images > 1:
         print(f"Training with {num_images} reference images using '{args.image_selection}' selection strategy")
     else:
         print("Training with a single reference image")
+        
+    # Initialize per-image loss tracking in the run_stats dictionary now that we have image_info
+    if "per_image_losses" not in run_stats:
+        run_stats["per_image_losses"] = {info["condition_id"]: [] for info in image_info}
+    
+    # Create a variable to track current image losses for this training session
+    current_image_losses = {info["condition_id"]: [] for info in image_info}
     
     # Save condition mapping to a JSON file
     condition_mapping_path = os.path.join(run_output_dir, "condition_mapping.json")
@@ -1374,8 +1477,7 @@ def main():
     
     # Create a fixed latent vector for progress visualization
     fixed_latent_vector = np.random.normal(0, 1, (1, args.latent_dim))
-    
-    # Initial visualization
+      # Initial visualization
     print("Creating initial visualization...")
     visualize_func = visualize_progress if args.no_async_visualization else visualize_progress_async
     
@@ -1386,9 +1488,11 @@ def main():
         viz_epoch = checkpoint_epoch if 'checkpoint_epoch' in locals() else len(run_stats["epoch_losses"])
     
     if args.no_async_visualization:
-        initial_image = visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
+        initial_image = visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, 
+                                      run_preview_dir, image_info=vis_target_info)
     else:
-        visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
+        visualize_func(generator, viz_epoch, fixed_latent_vector, vis_target_image, 
+                       run_preview_dir, image_info=vis_target_info)
         
     # If annotations exist for the visualization target, create an annotated visualization
     if vis_annotations:
@@ -1408,6 +1512,10 @@ def main():
     
     # Save last generated image for entropy comparison
     last_generated_image = None
+    
+    # Initialize per-image loss tracking
+    per_image_losses = {info["condition_id"]: [] for info in image_info}
+    step_counts = {info["condition_id"]: 0 for info in image_info}
     
     # Define a custom format for tqdm to show steps/sec instead of sec/it
     class StepsPerSecondBar(tqdm):
@@ -1502,11 +1610,13 @@ def main():
                         target_image, condition_id, latent_vector,
                         tag_tensor=tag_tensor
                     )
-            else:
-                # Standard training without annotations
+            else:                # Standard training without annotations
                 step_loss = generator.train_step(target_image, condition_id, latent_vector)
-                
-            epoch_loss += step_loss
+                epoch_loss += step_loss
+            
+            # Track loss per image
+            per_image_losses[condition_id].append(float(step_loss))
+            step_counts[condition_id] += 1
             
         # Calculate average loss for this epoch
         avg_epoch_loss = epoch_loss / args.steps_per_epoch
@@ -1520,16 +1630,27 @@ def main():
         # Update run statistics
         run_stats["epoch_losses"].append(float(avg_epoch_loss))
         run_stats["epoch_times"].append(float(epoch_duration))
-        
-        # Print progress
+          # Print progress
         if epoch % 10 == 0:
             avg_time = sum(epoch_times[-10:]) / min(10, len(epoch_times[-10:]))
             remaining = (args.epochs - epoch) * avg_time
             steps_per_second = args.steps_per_epoch / epoch_duration
+            
+            # Create a more informative message showing which image(s) were used for training
+            images_used_str = ""
+            if len(images) > 1:
+                # Show a summary when multiple images are used
+                if args.image_selection == 'sequential':
+                    current_img_idx = epoch % len(images)
+                    current_img = image_info[current_img_idx]
+                    images_used_str = f" [Training with: Ref #{current_img['condition_id']}: {current_img['filename']}]"
+                else:
+                    images_used_str = f" [Training with {len(images)} reference images]"
+                    
             print(f"Epoch {epoch}/{args.epochs}, Loss: {avg_epoch_loss:.6f}, " 
                   f"Steps: {args.steps_per_epoch}, Batch: {args.batch_size}, "
                   f"Steps/sec: {steps_per_second:.2f}, "
-                  f"Time: {epoch_duration:.3f}s, Remaining: {remaining/60:.1f}m")
+                  f"Time: {epoch_duration:.3f}s, Remaining: {remaining/60:.1f}m{images_used_str}")
         
         # Early stopping based on target accuracy or loss
         if args.target_accuracy is not None:
@@ -1544,11 +1665,26 @@ def main():
             run_stats["early_stopping_triggered"] = True
             run_stats["early_stopping_reason"] = f"Target loss of {args.target_loss} reached."
             break
-        
-        # Create visualization and save model if needed
+          # Create visualization and save model if needed
         if epoch % vis_interval == 0 or epoch == args.epochs:
             # Create visualization with the current target image
-            generated_image = visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, run_preview_dir)
+            generated_image = visualize_func(generator, epoch, fixed_latent_vector, vis_target_image, 
+                                            run_preview_dir, image_info=vis_target_info)
+            
+            # If we have multiple images, create visualizations for each one
+            if len(images) > 1 and epoch % (vis_interval * 2) == 0:
+                for idx, (img, info) in enumerate(zip(images, image_info)):
+                    # Skip the main visualization image since we already did it
+                    if info['condition_id'] == vis_target_info['condition_id']:
+                        continue
+                    
+                    # Create a specific directory for this reference image
+                    img_specific_dir = os.path.join(run_preview_dir, f"ref_{info['condition_id']}")
+                    os.makedirs(img_specific_dir, exist_ok=True)
+                    
+                    # Create visualization for this specific reference image
+                    visualize_func(generator, epoch, fixed_latent_vector, img, img_specific_dir, 
+                                  prefix=f"progress", image_info=info)
             
             # If annotations are available, create a visualization with them
             if vis_annotations and epoch % (vis_interval * 2) == 0:
@@ -1563,9 +1699,16 @@ def main():
             
             # Register this model for tracking and potential cleanup
             register_model_checkpoint(checkpoint_path, epoch, avg_epoch_loss)
-            
-            # Save loss plot
+              # Save loss plots
             save_loss_plot(losses, run_preview_dir)
+            
+            # Save per-image loss plots if we have multiple images
+            if len(images) > 1:
+                save_per_image_loss_plot(per_image_losses, image_info, run_preview_dir)
+            
+            # Save per-image losses in the run_stats
+            run_stats["per_image_losses"] = {k: v for k, v in per_image_losses.items()}
+            run_stats["per_image_step_counts"] = {k: v for k, v in step_counts.items()}
             
             # Save intermediate run statistics
             with open(os.path.join(run_output_dir, "run_stats.json"), 'w') as f:
@@ -1603,12 +1746,12 @@ def main():
                     
                     # Inject entropy to escape potential local minimum
                     fixed_latent_vector = inject_training_entropy(generator, fixed_latent_vector, epoch)
-                    
-                    # Force an immediate new visualization with the modified parameters
+                      # Force an immediate new visualization with the modified parameters
                     # to verify the entropy injection had an effect
                     new_generated_image = visualize_progress(generator, epoch, fixed_latent_vector, 
                                                           vis_target_image, run_preview_dir, 
-                                                          prefix=f"entropy_{epoch}", save_comparison=False)
+                                                          prefix=f"entropy_{epoch}", save_comparison=False,
+                                                          image_info=vis_target_info)
                     generated_image = new_generated_image
             
             # Store current generated image for next comparison
@@ -1643,6 +1786,22 @@ def main():
         
     run_stats["avg_epoch_time"] = float(avg_epoch_time)
     
+    # Add per-image summary statistics
+    if len(image_info) > 1:
+        per_image_summary = {}
+        for info in image_info:
+            condition_id = info['condition_id']
+            if condition_id in per_image_losses and len(per_image_losses[condition_id]) > 0:
+                losses = per_image_losses[condition_id]
+                per_image_summary[condition_id] = {
+                    "filename": info['filename'],
+                    "training_steps": len(losses),
+                    "avg_loss": float(sum(losses) / len(losses)) if losses else 0,
+                    "best_loss": float(min(losses)) if losses else 0,
+                    "best_step": losses.index(min(losses)) + 1 if losses else 0
+                }
+        run_stats["per_image_summary"] = per_image_summary
+    
     # Save final run statistics
     with open(os.path.join(run_output_dir, "run_stats.json"), 'w') as f:
         import json
@@ -1663,10 +1822,44 @@ def main():
     # Create a grid comparison of the model's output against all reference images
     if num_images > 1:
         create_final_comparison_grid(generator, fixed_latent_vector, images, image_info, run_preview_dir)
+        
+        # Save final per-image loss plots
+        if len(per_image_losses) > 1:
+            save_per_image_loss_plot(per_image_losses, image_info, run_preview_dir)
+            
+            # Print summary of per-image training performance
+            print("\nPer-image training performance summary:")
+            print("----------------------------------------")
+            for info in image_info:
+                condition_id = info['condition_id']
+                if condition_id in per_image_losses and len(per_image_losses[condition_id]) > 0:
+                    losses = per_image_losses[condition_id]
+                    avg_loss = sum(losses) / len(losses) if losses else 0
+                    best_loss = min(losses) if losses else 0
+                    best_step = losses.index(best_loss) + 1 if losses else 0
+                    print(f"  {info['filename']} (ID {condition_id}):")
+                    print(f"    - Training steps: {len(losses)}")
+                    print(f"    - Average loss: {avg_loss:.6f}")
+                    print(f"    - Best loss: {best_loss:.6f} (step {best_step})")
+            print("----------------------------------------\n")
+        
+        # Create individual final visualizations for each reference image
+        print(f"Creating individual final visualizations for {num_images} reference images...")
+        for idx, (img, info) in enumerate(zip(images, image_info)):
+            # Create a specific directory for this reference image
+            img_specific_dir = os.path.join(run_preview_dir, f"ref_{info['condition_id']}")
+            os.makedirs(img_specific_dir, exist_ok=True)
+            
+            # Create final visualization for this specific reference image
+            visualize_progress(generator, args.epochs, fixed_latent_vector, img, 
+                              img_specific_dir, prefix="final", image_info=info)
+            
+            print(f"  - Created final visualization for {info['filename']} (ID: {info['condition_id']})")
     
     # Regular final visualization with the first image
     final_image = visualize_progress(generator, args.epochs, fixed_latent_vector, 
-                                   vis_target_image, run_preview_dir, prefix="final", save_comparison=True)
+                                   vis_target_image, run_preview_dir, prefix="final", 
+                                   save_comparison=True, image_info=vis_target_info)
     
     # If annotations are available, create a final annotated visualization
     if vis_annotations:
@@ -1679,11 +1872,14 @@ def main():
     print(f"Run GUID: {run_guid}")
     print(f"Run output directory: {run_output_dir}")
     
-    # Save the final best image as SVG
-    final_svg_path = os.path.join(run_output_dir, 'final_output.svg')
-    save_as_svg(final_image, final_svg_path)
-    print(f"Final SVG output saved to {final_svg_path}")
-    
+    # Save final generated image as SVG
+    final_svg_path = os.path.join(run_preview_dir, "final_generated_image.svg")
+    if final_image is not None:
+        save_as_svg(final_image, final_svg_path)
+        print(f"Saved final generated SVG to {final_svg_path}")
+    else:
+        print(f"Skipping SVG save for {final_svg_path} because final_image is None.")
+
     # Create a symlink or copy of the latest run folder for easy access
     latest_run_link = os.path.join(args.output_dir, "latest_run")
     if os.path.exists(latest_run_link) and os.path.islink(latest_run_link):
