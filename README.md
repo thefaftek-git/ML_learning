@@ -65,6 +65,12 @@ Other available options:
 # Use GPU acceleration (if available):
 python src/train.py --use-gpu
 
+# Specify a particular GPU by its ID (e.g., 0, 1, 2).
+# Defaults to GPU 0 if --use-gpu is active and --gpu-id is not set.
+# You can find your GPU IDs by running `nvidia-smi` in your terminal
+# or by checking the output of `python src/debug_gpu.py`.
+python src/train.py --use-gpu --gpu-id 1
+
 # Optimize memory usage:
 python src/train.py --optimize-memory
 

@@ -87,6 +87,8 @@ def parse_args():
                       help='Number of worker threads for PyTorch (default: auto-detected based on CPU cores)')
     parser.add_argument('--use-gpu', action='store_true',
                       help='Use GPU acceleration if available')
+    parser.add_argument('--gpu-id', type=int, default=None,
+                        help='Specify the ID of the GPU to use (e.g., 0, 1, 2). If not specified, defaults to GPU 0 if --use-gpu is active.')
     parser.add_argument('--mixed-precision', action='store_true',
                       help='Use mixed precision training (speeds up GPU training)')
     parser.add_argument('--no-optimize-memory', action='store_true',
@@ -111,10 +113,13 @@ def parse_args():
     
     return parser.parse_args()
 
-def collect_system_info():
+def collect_system_info(device=None):
     """
     Collect system information for run metadata.
     
+    Args:
+        device: The torch device object being used for training.
+
     Returns:
         Dictionary containing system information
     """
@@ -131,9 +136,18 @@ def collect_system_info():
     # Add GPU information if available
     if torch.cuda.is_available():
         system_info["gpu_available"] = True
-        system_info["gpu_name"] = torch.cuda.get_device_name(0)
         system_info["gpu_count"] = torch.cuda.device_count()
         system_info["cuda_version"] = torch.version.cuda
+        if device and device.type == 'cuda':
+            if device.index is not None:
+                system_info["gpu_name"] = torch.cuda.get_device_name(device.index)
+            else:
+                # Should not happen if device is properly configured, but as a fallback
+                system_info["gpu_name"] = torch.cuda.get_device_name(0)
+        else:
+            # If GPU is available but not used by the script (e.g. use_gpu=False)
+            # or device info not passed yet (e.g. called before device setup)
+            system_info["gpu_name"] = torch.cuda.get_device_name(0) # Default to GPU 0 info
     else:
         system_info["gpu_available"] = False
     
@@ -1298,8 +1312,30 @@ def main():
       # We'll initialize per-image loss tracking later after loading the images
     # This avoids accessing image_info before it's defined
     
+    # Set up device first, so it can be passed to collect_system_info
+    if args.use_gpu and torch.cuda.is_available():
+        if args.gpu_id is not None:
+            if 0 <= args.gpu_id < torch.cuda.device_count():
+                device = torch.device(f"cuda:{args.gpu_id}")
+                print(f"Using specified GPU ID: {args.gpu_id} ({torch.cuda.get_device_name(args.gpu_id)})")
+            else:
+                print(f"Error: Invalid GPU ID {args.gpu_id}. Available GPUs are:")
+                for i in range(torch.cuda.device_count()):
+                    print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+                print("Falling back to CPU.")
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cuda:0")
+            print("No specific GPU ID provided, defaulting to GPU 0.")
+    else:
+        device = torch.device("cpu")
+        if args.use_gpu and not torch.cuda.is_available():
+            print("GPU requested but CUDA is not available. Using CPU.")
+        elif not args.use_gpu:
+            print("Using CPU for training.")
+
     # Collect system information at the beginning of the run
-    system_info = collect_system_info()
+    system_info = collect_system_info(device)
     
     # Save run metadata (or update it if resuming)
     run_metadata = {
@@ -1326,11 +1362,9 @@ def main():
             torch.set_num_threads(optimal_threads)
             print(f"Setting PyTorch to use {optimal_threads} threads (detected {num_cores} CPU cores)")
     
-    # Set up device
-    device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
+    # Device setup is now done before collect_system_info
     if device.type == "cuda":
-        print(f"Using GPU acceleration: {torch.cuda.get_device_name(0)}")
-        
+        # GPU name reporting is handled during device setup
         # Set CUDA performance optimizations
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
@@ -1342,8 +1376,7 @@ def main():
             # Import autocast for mixed precision
             from torch.cuda.amp import autocast, GradScaler
             scaler = GradScaler()
-    else:
-        print("Using CPU for training")
+    elif device.type == "cpu": # Already printed "Using CPU for training" or "Falling back to CPU"
         # For CPU optimization, ensure we're using MKL if available
         try:
             import mkl
